@@ -123,7 +123,7 @@ class schema_context(ContextDecorator):
 
     def __enter__(self):
         self.connection = connections[self.database]
-        self.previous_tenant = connection.tenant
+        self.previous_tenant = self.connection.tenant
         self.connection.set_schema(self.schema_name)
 
     def __exit__(self, *exc):
@@ -142,7 +142,7 @@ class tenant_context(ContextDecorator):
 
     def __enter__(self):
         self.connection = connections[self.database]
-        self.previous_tenant = connection.tenant
+        self.previous_tenant = self.connection.tenant
         self.connection.set_tenant(self.tenant)
 
     def __exit__(self, *exc):

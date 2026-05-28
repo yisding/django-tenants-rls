@@ -74,6 +74,7 @@ Contents
    
    install
    use
+   rls
    examples
    files
    test

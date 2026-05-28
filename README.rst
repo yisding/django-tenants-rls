@@ -224,6 +224,48 @@ tenant specific apps. Complete instructions can be found at
 
 
 
+Row-Level Security (shared-schema mode)
+---------------------------------------
+
+In addition to the default schema-per-tenant isolation, django-tenants ships an
+optional shared-schema mode based on `PostgreSQL Row-Level Security`_. All
+tenants share the single ``public`` schema and isolation is enforced by RLS
+policies on a ``tenant`` foreign key. It is **opt-in and off by default** —
+with ``TENANT_RLS_ENABLED`` unset the RLS backend behaves exactly like the
+standard backend.
+
+The short version:
+
+1. Add ``django_tenants.rls`` to ``SHARED_APPS`` (RLS apps live in
+   ``SHARED_APPS``, **never** ``TENANT_APPS``).
+2. Set ``TENANT_RLS_ENABLED = True``.
+3. Switch the tenant database ``ENGINE`` to ``django_tenants.rls.backend``.
+4. Make isolated models inherit ``django_tenants.rls.models.TenantRLSModel``
+   (adds the ``tenant`` FK), then ``makemigrations`` and
+   ``migrate_schemas --shared``.
+5. Enable RLS + policies via ``manage.py enable_rls`` (or the
+   ``TENANT_RLS_AUTO_ENABLE`` ``post_migrate`` hook, or explicit
+   ``EnableRLS`` / ``CreateTenantPolicy`` migration operations).
+
+The application database role **must** be ``NOSUPERUSER NOBYPASSRLS`` —
+PostgreSQL silently bypasses every RLS policy for a superuser or
+``BYPASSRLS`` role, so a bypassing role now blocks startup with an error
+(set ``TENANT_RLS_ALLOW_BYPASS_ROLE = True`` to opt out, at the cost of the
+safety net). See ``docs/rls.rst`` for the least-privilege ``CREATE ROLE``
+recipe.
+
+.. code-block:: python
+
+    from django_tenants.rls.session import bypass_rls
+
+    with bypass_rls():
+        MyModel.objects.all()   # admin / cross-tenant: sees ALL tenants' rows
+
+See the full drop-in guide in ``docs/rls.rst`` for ``SHARED_APPS`` vs
+``TENANT_APPS`` placement, ``TenantSyncRouter`` interaction, migrations, and
+``bypass_rls`` usage.
+
+
 Running the example project
 ---------------------------
 
@@ -286,6 +328,7 @@ If this project helped you reduce development time, you can give me cake :)
 .. _youtube: https://youtu.be/TWF7okf5Xoo
 .. _django: https://www.djangoproject.com/
 .. _PostgreSQL schemas: http://www.postgresql.org/docs/9.1/static/ddl-schemas.html
+.. _PostgreSQL Row-Level Security: https://www.postgresql.org/docs/current/ddl-rowsecurity.html
 .. _PostgreSQL’s official documentation on schemas: http://www.postgresql.org/docs/9.1/static/ddl-schemas.html
 .. _Multi-Tenant Data Architecture: https://web.archive.org/web/20160311212239/https://msdn.microsoft.com/en-us/library/aa479086.aspx
 .. _setup: https://django-tenants.readthedocs.org/en/latest/install.html
