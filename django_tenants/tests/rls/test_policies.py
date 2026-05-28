@@ -281,3 +281,43 @@ class DeconstructTestCase(unittest.TestCase):
         self.assertEqual(kwargs["operation"], BasePolicy.INSERT)
         self.assertEqual(kwargs["permissive"], False)
         self.assertEqual(kwargs["roles"], ["app_role"])
+
+
+class InsertPolicyUsingClauseTestCase(unittest.TestCase):
+    """An INSERT policy must not emit a USING clause.
+
+    PostgreSQL rejects ``CREATE POLICY ... FOR INSERT ... USING (...)``; only
+    ``WITH CHECK`` is valid there. ``get_using_expression()`` must therefore
+    return None for INSERT while keeping the WITH CHECK expression.
+    """
+
+    def _policy(self, operation):
+        return TenantPolicy(
+            name="p",
+            tenant_field="tenant",
+            session_variable="a.b",
+            bypass_variable="c.d",
+            pk_cast="integer",
+            operation=operation,
+        )
+
+    def test_insert_has_no_using_but_has_check(self):
+        policy = self._policy(BasePolicy.INSERT)
+        self.assertIsNone(policy.get_using_expression())
+        self.assertIsNotNone(policy.get_check_expression())
+
+    def test_non_insert_operations_keep_using(self):
+        for op in (BasePolicy.ALL, BasePolicy.SELECT,
+                   BasePolicy.UPDATE, BasePolicy.DELETE):
+            self.assertIsNotNone(
+                self._policy(op).get_using_expression(),
+                "USING should be present for operation %r" % op,
+            )
+
+    def test_custom_insert_policy_also_suppresses_using(self):
+        policy = CustomPolicy(
+            name="c", expression="tenant_id IS NOT NULL",
+            operation=BasePolicy.INSERT,
+        )
+        self.assertIsNone(policy.get_using_expression())
+        self.assertEqual(policy.get_check_expression(), "tenant_id IS NOT NULL")

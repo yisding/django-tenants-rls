@@ -31,6 +31,9 @@ ALLOWED_HOSTS = []
 
 SHARED_APPS = (
     'django_tenants',  # mandatory
+    'django_tenants.rls',  # RLS subpackage: registers system checks + management
+                           # commands so the RLS test suite runs. With
+                           # TENANT_RLS_ENABLED unset this is a no-op (off by default).
     'customers',  # you must list the app where your tenant model resides in
 
     'django.contrib.auth',

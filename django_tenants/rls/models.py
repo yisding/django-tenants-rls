@@ -267,7 +267,16 @@ class TenantRLSModel(models.Model, metaclass=RLSModelMeta):
         if conf.rls_enabled() and getattr(self, attname, None) in (None, ""):
             from django.db import connections
 
-            conn = connections[get_tenant_database_alias()]
+            # Resolve the connection actually used for THIS save so a multi-database
+            # write is stamped from the right connection's tenant, not always the
+            # default tenant alias: explicit using= > the instance's bound db
+            # (self._state.db) > the tenant database alias.
+            using = (
+                kwargs.get("using")
+                or self._state.db
+                or get_tenant_database_alias()
+            )
+            conn = connections[using]
             # (a) GUC source of truth first: rls_context()+create() sets this but
             # never connection.tenant, so this must win over the bound object.
             rls_tenant_id = getattr(conn, "_rls_tenant_id", None)

@@ -47,9 +47,10 @@ schema, with a tenant foreign key on every isolated table. Consider it when:
   not by your application code) without per-schema overhead.
 
 Schema-per-tenant remains the default and is the right choice for strong
-physical separation. RLS mode and schema-per-tenant mode can coexist in the
-same project on a per-app basis (a *hybrid* deployment); see
-:ref:`SHARED_APPS vs TENANT_APPS <shared-apps-vs-tenant-apps>`.
+physical separation. RLS mode and schema-per-tenant mode can coexist in one
+project, but the choice is made **per database connection** -- a connection
+running the RLS backend serves only the shared ``public`` schema and cannot also
+serve schema-per-tenant ``TENANT_APPS`` (see `Hybrid deployments`_).
 
 
 .. _rls-mechanism:
@@ -300,10 +301,26 @@ data into ``public`` with a ``tenant`` foreign key populated for every row.
 Hybrid deployments
 ------------------
 
-A hybrid is allowed: some apps stay schema-per-tenant (in ``TENANT_APPS``) while
-others are RLS-isolated-in-public (in ``SHARED_APPS``). Mixing isolation models
-per app is supported, but each RLS app **must** be in ``SHARED_APPS`` and must
-be a deliberate choice.
+The isolation model is chosen **per database connection, not per app on a single
+connection.** The RLS backend pins ``search_path`` to ``public`` for every tenant
+(that is how shared-schema isolation works), so a connection that uses
+``django_tenants.rls.backend`` **cannot** also serve schema-per-tenant
+``TENANT_APPS``: those tables live in per-tenant schemas that are no longer on the
+search path, and queries against them will fail. Do not expect ``TENANT_APPS`` to
+remain schema-isolated on a connection running the RLS backend.
+
+A hybrid is therefore possible, but at the connection/database level:
+
+* Put every RLS-isolated app in ``SHARED_APPS`` on the RLS-backend connection
+  (the single most important rule -- see
+  :ref:`SHARED_APPS vs TENANT_APPS <shared-apps-vs-tenant-apps>`); and
+* if you still need schema-per-tenant apps, route them to a **separate**
+  ``DATABASES`` alias that uses the standard ``django_tenants.postgresql_backend``
+  (via a database router), where ``TENANT_APPS`` keep working as before.
+
+During the migration itself ``TENANT_APPS`` is expected to be non-empty
+transiently as you move apps to ``SHARED_APPS``; just do not point production
+tenant traffic for those apps at the RLS-backend connection until they have moved.
 
 
 Step 5 -- Make models inherit TenantRLSModel
@@ -540,10 +557,15 @@ RLS is enabled at all) so the writes are not themselves filtered:
             for tenant in TenantModel.objects.exclude(schema_name=public):
                 # Stamp THIS tenant's pk into tenant_id for every row copied
                 # out of THIS tenant's schema.
+                # Quote the schema identifier via the connection's quoting
+                # helper rather than hand-wrapping it in double quotes -- schema
+                # names permit characters that would otherwise let a stray quote
+                # break out of the identifier.
+                schema = connection.ops.quote_name(tenant.schema_name)
                 cur.execute(
                     'INSERT INTO public.blog_note (%s, tenant_id) '
-                    'SELECT %s, %%s FROM "%s".blog_note'
-                    % (col_sql, col_sql, tenant.schema_name),
+                    'SELECT %s, %%s FROM %s.blog_note'
+                    % (col_sql, col_sql, schema),
                     [tenant.pk],
                 )
 
