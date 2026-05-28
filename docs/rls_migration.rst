@@ -429,18 +429,20 @@ stays silent rather than raising a false alarm.
 Connection poolers
 ------------------
 
-Persistent connections (``CONN_MAX_AGE``) and external poolers are safe with the
-RLS backend because the active tenant is not pinned to a connection once. The
-backend re-asserts the tenant and bypass session variables on **every cursor**,
-driven from the connection's Python state -- so a connection handed back from a
-pool, or reused after a transaction rollback, always reflects the *current*
-request's tenant rather than a leftover from a previous one.
+Persistent connections (``CONN_MAX_AGE``) are safe with the RLS backend: it
+re-asserts the tenant and bypass session variables on **every cursor** from the
+connection's Python state, so a connection reused by a later request -- or after
+a transaction rollback -- always reflects the *current* tenant rather than a
+leftover from a previous one.
 
-PgBouncer in transaction-pooling mode and similar configurations carry
-additional caveats around session-scoped state; those are covered in detail
-later in this guide (see :ref:`rls-migration-performance`). For prerequisites it
-is enough to know that the per-cursor re-assertion makes pooled and persistent
-connections correct by construction.
+**External connection poolers (PgBouncer, RDS Proxy, pgcat) must run in session
+pooling mode.** The tenant GUC is set at SESSION scope as a statement *separate*
+from the query it protects; under transaction- or statement-pooling those two
+statements can be routed to different server backends, which strands the tenant
+context (queries return zero rows) or -- worst case -- runs your query on a
+backend still carrying another client's tenant. This is a hard requirement, not
+a tuning knob; see :ref:`rls-migration-poolers` for the mechanism and the only
+transaction-pooling-safe alternative.
 
 
 .. _rls-migration-assessment:
@@ -888,12 +890,15 @@ build confidence without risking the live read path.
 .. tip::
 
    **Re-run isolation validation through your connection pooler, not just a
-   direct connection.** The RLS backend
-   (``django_tenants.rls.backend``) re-asserts the tenant and bypass session
-   variables on *every* cursor from the connection's Python-side state, so
-   isolation stays correct across pooled/reused connections and across
-   transaction rollback. Validate through the pooler anyway -- it is the
-   configuration production runs.
+   direct connection** -- it is the configuration production runs. The RLS
+   backend re-asserts the tenant/bypass GUCs on *every* cursor, which keeps
+   isolation correct across reused connections **only under session pooling**.
+   If your pooler is in transaction/statement mode, this is exactly where the
+   isolation breaks (see :ref:`rls-migration-poolers`): add a CI test that runs
+   the two-tenant isolation check *through* the pooler in its production mode and
+   asserts the result -- under transaction pooling you should observe stranded
+   context (zero rows) or a leak, which is your signal to switch to session
+   pooling.
 
 .. danger::
 
@@ -2493,11 +2498,12 @@ enough to proceed toward decommissioning the old schemas. If anything fails, do
 
    The RLS backend re-asserts both the tenant and bypass GUCs from the
    connection's Python state on *every* cursor it opens, so these results are
-   stable across pooled or reused connections and across transaction rollback.
-   If you run the tests through a connection pooler (PgBouncer in transaction
-   mode, etc.), make sure it is connecting as the same ``NOSUPERUSER`` role --
-   the pooler does not change the per-cursor re-assertion, but it must not
-   substitute a privileged role.
+   stable across reused connections and across transaction rollback **under
+   session pooling**. Run the tests through your pooler in its production mode
+   and as the same ``NOSUPERUSER`` role. If that mode is transaction/statement
+   pooling, expect these checks to FAIL (stranded context or a leak) -- that is
+   the documented incompatibility, not a test bug; switch the pooler to session
+   mode (see :ref:`rls-migration-poolers`).
 
 
 .. _rls-migration-decommission:
@@ -2827,6 +2833,274 @@ settings -- so the state it produces reflects ``TENANT_RLS_FORCE`` as it stands
 now, not whatever it was before the rollback.
 
 
+.. _rls-migration-third-party:
+
+Third-party packages and plugins under RLS
+==========================================
+
+Most of the migration above is about *your* models. The subtler risk is the
+**rest of your stack**: a package that works perfectly under schema-per-tenant
+can quietly misbehave -- or silently lose isolation -- once RLS mode is on,
+because classic django-tenants gave it isolation "for free" through two
+primitives RLS removes: a distinct ``connection.schema_name`` per tenant, and a
+per-schema *copy* of every ``TENANT_APPS`` table reached via ``search_path``.
+Under RLS there is one ``public`` schema, ``connection.schema_name`` is pinned to
+the literal ``"public"`` for every tenant, and isolation is carried only by the
+tenant session GUC plus a policy on tables that have a ``tenant_id`` column.
+Anything that previously rode on schema-per-tenant must now be re-derived from
+tenant *identity* (``connection.tenant``), not from ``connection.schema_name``.
+
+Three failure classes follow; walk your dependency list against them.
+
+The three failure classes
+-------------------------
+
+#. **Unpolicied third-party models share data across tenants (silent, worst
+   case).** RLS applies only to tables with a ``tenant_id`` column and a policy
+   -- i.e. ``TenantRLSModel`` subclasses (or tables you policy by hand). A
+   third-party model you cannot edit lands in the single ``public`` table with
+   **no** ``tenant_id`` and **no** policy; queries succeed and the rows are
+   shared by every tenant. The drift check :ref:`W004 <rls-system-checks>` only
+   inspects ``TenantRLSModel`` subclasses, so it will **not** catch these.
+#. **Anything keyed on ``connection.schema_name`` collapses (silent).** Cache
+   key prefixes, per-tenant file/media paths, lock names, log tags -- if built
+   from ``connection.schema_name`` they now resolve to ``"public"`` for every
+   tenant, so all tenants share one namespace. These live *outside* Postgres, so
+   RLS gives **zero** protection and no check fires.
+#. **Out-of-request code starts with no tenant (loud, fail-closed).** Celery
+   tasks, Channels consumers, management commands, and signal handlers run
+   without ``TenantMainMiddleware``, so the tenant GUC is at its empty sentinel:
+   policied reads return **zero rows** and policied writes are rejected by
+   ``WITH CHECK`` until the code sets the tenant with ``with rls_context(tenant):``.
+
+The one rule
+------------
+
+   **Every tenant-scoped model -- including third-party ones -- must carry a
+   ``tenant_id`` column and an RLS policy, and every cache / storage / lock key
+   must derive from the tenant identity, not from ``connection.schema_name``.
+   Anything else is shared across all tenants.**
+
+What the library ships to help
+------------------------------
+
+Three failure-class-2 problems have first-party fixes (see
+:ref:`rls-cache-storage-celery` for usage):
+
+* ``django_tenants.rls.cache.make_key`` / ``reverse_key`` -- drop-in
+  ``KEY_FUNCTION`` / ``REVERSE_KEY_FUNCTION`` keyed on the real tenant.
+* ``django_tenants.rls.storage.RLSTenantFileSystemStorage`` (+ an
+  ``S3Boto3Storage`` recipe in that module) -- per-tenant media keyed on the
+  real tenant.
+* ``django_tenants.rls.celery.register()`` -- ``task_prerun`` / ``task_postrun``
+  handlers so a worker never inherits a prior task's tenant or bypass.
+
+Everything else here is **yours to change in your own code** -- the library
+cannot policy a model it does not define or re-key a function it does not own.
+
+Compatibility at a glance
+-------------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 20 52
+
+   * - Package / category
+     - Under RLS
+     - What to do
+   * - Token auth (``rest_framework.authtoken``)
+     - Breaks (silent)
+     - Third-party ``Token`` has no ``tenant_id``/policy → one shared token
+       table. Policy it by hand, or use a first-party token model.
+   * - JWT blacklist (``simplejwt`` ``token_blacklist``)
+     - Breaks (silent)
+     - ``OutstandingToken`` / ``BlacklistedToken`` shared across tenants. Policy
+       them, or accept a documented *global* blacklist.
+   * - Vendored / private auth backends
+     - Review required
+     - Tenant-scoped models you cannot edit are unpolicied → shared. Inventory
+       its models; policy each per-tenant table.
+   * - Cache key isolation (e.g. django-redis)
+     - Breaks (silent)
+     - If keyed on ``schema_name`` it collapses. Switch ``KEY_FUNCTION`` to
+       ``django_tenants.rls.cache.make_key``.
+   * - Per-tenant file storage (e.g. django-storages)
+     - Breaks (silent)
+     - If the prefix is from ``schema_name`` all tenants share it. Use
+       ``RLSTenantFileSystemStorage`` / the S3 recipe.
+   * - ASGI / WebSockets (Channels)
+     - Needs adaptation
+     - No middleware runs; wrap each DB block in ``rls_context(tenant)``. Mostly
+       fails closed; a reused connection can leak.
+   * - Bulk admin import (e.g. django-import-export)
+     - Needs adaptation
+     - ``use_bulk=True`` skips ``save()`` → ``tenant_id`` NULL → rejected; a
+       resource on a non-policied model exports all tenants.
+   * - Redis locks (e.g. python-redis-lock)
+     - Pre-existing
+     - Lock names were never schema-scoped; RLS neither causes nor fixes this.
+       Prefix names with the tenant if collisions matter.
+   * - Admin confirmation (e.g. django-admin-confirm)
+     - Fixed via cache
+     - Stashes in-flight edits in the shared cache; fixed once ``KEY_FUNCTION``
+       is tenant-aware.
+   * - DRF, django-filter, drf-spectacular, CORS, WhiteNoise, health-check, field
+       helpers
+     - Unaffected
+     - No tenancy primitive in their path; they inherit isolation from the models
+       they touch.
+
+Per-package notes
+-----------------
+
+Token authentication (DRF ``authtoken``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``rest_framework.authtoken.Token`` cannot inherit ``TenantRLSModel``, so under
+RLS there is one shared ``public.authtoken_token`` with no policy and
+``TokenAuthentication`` looks tokens up by key alone -- **a token minted for
+tenant A authenticates as tenant B**. Policy the table yourself (your migration,
+not the library): add a nullable ``tenant_id``, backfill it, ``SET NOT NULL``,
+then apply RLS + a policy whose expression matches ``TenantPolicy``:
+
+.. code-block:: sql
+
+   ALTER TABLE authtoken_token ENABLE ROW LEVEL SECURITY;
+   ALTER TABLE authtoken_token FORCE ROW LEVEL SECURITY;
+   CREATE POLICY authtoken_token_tenant_isolation ON authtoken_token
+     USING (tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', true), '')::integer)
+            OR (SELECT current_setting('django_tenants.bypass_rls', true)) = 'on')
+     WITH CHECK (tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', true), '')::integer)
+            OR (SELECT current_setting('django_tenants.bypass_rls', true)) = 'on');
+
+Populate ``tenant_id`` on token creation (override the creation path or a
+``BEFORE INSERT`` trigger defaulting to the GUC), or -- cleaner long term -- use a
+first-party token model that subclasses ``TenantRLSModel`` with a custom DRF auth
+class. Backfill before enabling RLS (see :ref:`rls-backfill-recipe`); NULL
+``tenant_id`` rows are invisible to everyone. **Verify:** mint a token under
+tenant A, switch to tenant B, assert it does not authenticate and that
+``Token.objects.count()`` with no tenant active is ``0``.
+
+JWT (``simplejwt``) and the user model
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Stateless JWTs need no table, and the normal request path works (the middleware
+sets the GUC before the view runs). Two caveats: (1) the optional
+``token_blacklist`` app's ``OutstandingToken`` / ``BlacklistedToken`` are
+third-party and unpolicied → a token blacklisted in one tenant is treated as
+blacklisted everywhere and listings leak; policy them as above or accept a
+documented *global* blacklist. (2) **Check where ``AUTH_USER_MODEL`` lives.** If
+the user app is in ``SHARED_APPS`` (the usual case) lookups were always global --
+fine, but your auth class must enforce the per-tenant membership check against a
+policied table. If the user app was in ``TENANT_APPS`` and ``User`` is not
+policied, ``auth_user`` is now one shared table and a JWT/`get_user()` can
+authenticate **any** tenant's user by id -- a cross-tenant auth hole. Token
+rotation / ``flushexpiredtokens`` run out-of-request: wrap per-tenant sweeps in
+``with rls_context(tenant):`` (or a global sweep in ``with bypass_rls():``).
+
+Vendored / private auth backends
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A private auth package you cannot modify is the highest-uncertainty item: if it
+defines tenant-scoped models that were in ``TENANT_APPS``, they are now one
+shared table with no policy -- and because it is auth, that can let one tenant
+act as another. Inventory its models (see the checklist below), determine which
+hold per-tenant data, and for each one you cannot edit, add ``tenant_id`` + a
+policy via your own DDL migration and backfill before enabling RLS. If its models
+were intentionally global (already in ``SHARED_APPS``), there is no regression.
+
+Cache (e.g. django-redis)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If you isolated the cache by wiring ``KEY_FUNCTION`` to
+``django_tenants.cache.make_key`` (which prefixes with ``connection.schema_name``),
+every tenant's keyspace collapses to ``public:`` under RLS -- sessions, cached
+querysets, rate-limit counters and cache-based locks leak. Postgres RLS does not
+reach Redis. Switch ``KEY_FUNCTION`` / ``REVERSE_KEY_FUNCTION`` to
+``django_tenants.rls.cache.make_key`` / ``reverse_key`` (same key shape, sourced
+from the real tenant), then **flush / namespace-bump Redis** so stale
+``public:``-prefixed entries written during the broken window are not served.
+Ensure out-of-request code sets the tenant before any cache access, or the key
+falls back to the public prefix.
+
+File / media storage (e.g. django-storages S3)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Per-tenant media isolation comes from prefixing the storage key by the tenant. If
+that prefix derives from ``connection.schema_name`` (the standard
+``parse_tenant_config_path`` pattern), it collapses to one prefix and all tenants
+read/write the same objects -- with no DB protection. Use
+``django_tenants.rls.storage.RLSTenantFileSystemStorage`` for local media, and for
+S3 override ``location`` to prepend ``current_tenant_schema()`` (recipe in that
+module's docstring) instead of ``connection.schema_name``. Code touching storage
+outside a request (thumbnailing tasks, commands) must establish tenant context
+first. Audit any objects written under the collapsed prefix during testing.
+
+Channels / ASGI
+~~~~~~~~~~~~~~~
+
+``TenantMainMiddleware`` is WSGI-only; a WebSocket consumer's DB access runs with
+no tenant set, so wrap **every** ``database_sync_to_async`` block in
+``with rls_context(tenant):`` (resolve the tenant *object* in your scope
+middleware -- ``schema_context`` resolves to a pk-less ``FakeTenant`` and yields
+zero rows). Re-activate after ``aclose_old_connections``/reconnect. This mostly
+fails closed (zero rows); a long-lived consumer reusing a connection whose tenant
+was left set is the narrow leak case. Channel-layer group names are not policied
+-- tenant-namespace them yourself, as in classic mode.
+
+Bulk admin import/export (e.g. django-import-export)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Export of a ``TenantRLSModel`` is *safer* than before (no tenant → zero rows).
+Row-by-row import works (``save()`` auto-stamps ``tenant_id``). But ``use_bulk =
+True`` calls ``bulk_create`` / ``bulk_update``, which skip ``save()`` → the
+WITH CHECK policy rejects the INSERT (loud). Set ``use_bulk = False``, or stamp
+``instance.tenant_id`` in ``before_save_instance``. And only register resources
+for ``TenantRLSModel`` models: a resource on an unpolicied model exports every
+tenant's rows. Commands/Celery runs need ``with rls_context(tenant):``.
+
+Redis locks and admin confirmation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``python-redis-lock`` lock names were never schema-namespaced (Redis is one store
+in classic mode too), so RLS introduces no new regression -- but if a lock name
+is built only from a session/user id with no tenant component, that is a
+pre-existing cross-tenant collision; prefix it with the tenant. ``django-admin-confirm``
+stashes in-flight confirmation state in the shared cache with no tenant component;
+it is fixed automatically once your cache ``KEY_FUNCTION`` is tenant-aware (above).
+
+Adopter checklist (grep your own codebase)
+------------------------------------------
+
+Every item above depends on *your* settings and code. Concretely:
+
+.. code-block:: console
+
+   # Cache / storage / lock keys keyed on schema_name (failure class 2):
+   grep -rn "KEY_FUNCTION\|REVERSE_KEY_FUNCTION" <settings>     # -> rls.cache.make_key?
+   grep -rn "STORAGES\|DEFAULT_FILE_STORAGE\|STATICFILES_STORAGE" <settings>
+   grep -rn "connection.schema_name\|parse_tenant_config_path" <app>  # cache/lock/path/group names
+
+   # Third-party / non-policied tenant models (failure class 1):
+   grep -rn "rest_framework.authtoken" <settings>              # in TENANT_APPS?
+   grep -rn "AUTH_USER_MODEL" <settings>                       # SHARED_APPS (safe) vs TENANT_APPS (danger)
+   python manage.py shell -c "from django.apps import apps; [print(m._meta.label, m._meta.db_table) for m in apps.get_models()]"
+   # then in psql, for each suspect per-tenant table:
+   #   SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname IN (...);
+   #   SELECT * FROM pg_policies WHERE tablename IN (...);   -- empty policy set on a per-tenant table = the bug
+
+   # Out-of-request execution (failure class 3):
+   grep -rn "call_command\|database_sync_to_async\|@shared_task\|@app.task\|post_save\|pre_save" <app>
+
+   # Confirm the runtime role cannot bypass RLS:
+   python manage.py check --database default                  # W003 must NOT fire
+
+After fixing, run ``manage.py verify_rls`` in CI (it fails non-zero if any
+``TenantRLSModel`` table is missing RLS/FORCE/a policy), and re-run a two-tenant
+isolation check for tokens, cached values, files, and any policied third-party
+table.
+
+
 .. _rls-migration-performance:
 
 Performance and operations after cutover
@@ -2919,42 +3193,63 @@ each one as a tenant-leading composite. Unique constraints in particular almost
 always need ``tenant_id`` added as the leading column, since a value that was
 unique within a schema is no longer unique within the shared table.
 
+.. _rls-migration-poolers:
+
 Connection poolers
 ------------------
 
-Per-cursor re-assertion is what makes RLS correct on pooled and persistent
-connections. The backend derives both GUCs from the connection's Python
+Per-cursor re-assertion makes RLS correct across pooled and persistent
+connections *as long as the pooler keeps a client on one server backend for the
+work that needs it*. The backend derives both GUCs from the connection's Python
 source-of-truth (``_rls_tenant_id`` and ``_rls_bypass``) on every cursor, so a
-connection handed back to a different request -- or reused after a transaction
-rollback -- always carries the correct tenant and a bypass that has snapped back
-to ``off``. This is the same reasoning behind the bypass-leak guard; see
-:ref:`bypass-leak-note`.
+connection reused by a different request -- or after a transaction rollback --
+carries the correct tenant and a bypass that has snapped back to ``off`` (see
+:ref:`bypass-leak-note`).
 
-**PgBouncer is safe.** Because state is re-asserted from Python on every cursor
-rather than assumed to persist on the server connection, a pooler that swaps the
-underlying server connection between checkouts cannot cause cross-tenant leakage.
+.. important::
 
-There is, however, a **pooling-mode consideration**, because the GUC is set at
-**SESSION scope** -- the ``false`` third argument to ``set_config(...)`` (see
-``SET_RLS_SESSION_SQL`` in the backend and ``SET_CONFIG_SQL`` in
-``django_tenants/rls/session.py``):
+   **An external server-side pooler MUST run in session pooling mode.** The
+   tenant GUC is set at **SESSION scope** (the ``false`` third argument to
+   ``set_config(...)`` -- see ``SET_RLS_SESSION_SQL`` in the backend and
+   ``SET_CONFIG_SQL`` in ``django_tenants/rls/session.py``) and, under Django's
+   default autocommit, the per-cursor ``set_config`` and the query it protects
+   are **two separate statements in two separate transactions**.
 
-* **Session pooling** (the conservative choice): a client keeps the same server
-  connection for the life of its session. Session-scope GUCs behave exactly as
-  Django expects; this mirrors how the parent backend's persistent
-  ``search_path`` works. Recommended if you are unsure.
-* **Transaction pooling**: the server connection can change between
-  transactions. This is still correct *because* the backend re-asserts the GUCs
-  per cursor from Python state -- the value is never assumed to survive on the
-  server connection. Note that a SESSION-scope ``set_config`` persists only until
-  that server connection is returned to the pool, which is fine here since it is
-  re-applied on the next cursor. Do not attempt to "set the tenant once per
-  request and rely on it persisting"; the design does not -- and must not --
-  depend on that.
+   * **Session pooling** -- a client holds one server backend for its whole
+     session, so the ``set_config`` and the following query always run on the
+     same backend. Correct, and it mirrors how the parent backend's persistent
+     ``search_path`` works. **Use this.**
+   * **Transaction / statement pooling** -- the pooler may hand the
+     ``set_config`` and the query to *different* server backends. The query then
+     runs either on a backend whose tenant GUC was never set (secure-default
+     **zero rows** -- a silent availability bug that only appears under
+     production concurrency) or, worst case, on one still holding a **previous
+     client's** tenant GUC (**cross-tenant read**). Per-cursor re-assertion does
+     **not** rescue this: it pins the GUC on the backend that ran ``set_config``,
+     not on the one that runs the query. **Unsupported.**
 
-In short: the isolation guarantee comes from Python-driven per-cursor
-re-assertion, not from the GUC persisting, so any PgBouncer mode is safe. Choose
-the mode on the usual throughput/compatibility grounds.
+   The only transaction-pooling-safe configuration is to make the ``set_config``
+   and the query share one transaction -- e.g. ``ATOMIC_REQUESTS = True`` (or an
+   explicit ``transaction.atomic()`` around all tenant work) so both land on the
+   same backend. The default autocommit design does not do this, so treat
+   transaction/statement pooling as unsupported unless you have wrapped every
+   tenant query in a transaction *and* validated isolation through the pooler.
+
+.. note::
+
+   **RDS Proxy / connection multiplexing.** A SESSION-scope ``set_config`` on
+   every cursor **pins** the proxied connection -- the proxy can no longer
+   multiplex it -- which collapses the benefit RDS Proxy exists to provide.
+   Prefer plain session pooling and size the pool accordingly; do not try to
+   move the tenant into a proxy ``init`` query.
+
+.. note::
+
+   **Server-side cursors.** ``QuerySet.iterator()`` and other named/server-side
+   cursors FETCH across multiple round-trips; under transaction pooling those
+   fetches can land on a backend that never had the GUC set and silently return
+   nothing. If you use them, set ``DISABLE_SERVER_SIDE_CURSORS = True`` or route
+   those reads through a session-pooled connection.
 
 Stock-backend fallback: keep ``TenantRLSMiddleware``
 ----------------------------------------------------
@@ -2981,6 +3276,16 @@ Under that deployment there is no per-cursor re-assertion to fall back on, so
 bypass-leak gap on pooled/persistent connections described in
 :ref:`bypass-leak-note`. On the RLS backend the middleware is redundant but
 harmless, so it is safe to leave installed in either deployment.
+
+.. warning::
+
+   The fallback middleware sets the tenant GUC **once per request**, with no
+   per-cursor re-assertion behind it. It therefore depends on every query in the
+   request reaching the *same* server backend, so the stock-backend + middleware
+   deployment requires **session pooling** even more strictly than the RLS
+   backend does (see :ref:`rls-migration-poolers`): under transaction/statement
+   pooling the tenant is stranded mid-request. The RLS backend (per-cursor
+   re-assertion) is the more robust choice and is recommended.
 
 Planner, statistics, and autovacuum
 ------------------------------------
