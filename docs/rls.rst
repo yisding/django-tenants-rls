@@ -833,8 +833,20 @@ Lower-level helpers (``set_current_tenant``, ``clear_current_tenant``,
 .. warning::
 
    ``bypass_rls()`` removes tenant isolation for the duration of the block. Use
-   it deliberately and keep the block as small as possible. In the admin, scope
-   it to the views/querysets that genuinely need cross-tenant visibility.
+   it deliberately and keep the block as small as possible. Use it **only** for
+   work that genuinely needs to see or write across tenants.
+
+.. important::
+
+   **A normal, per-tenant Django admin needs NO bypass.** When the admin is
+   served through ``TenantMainMiddleware`` (or the RLS backend / fallback
+   middleware) the active tenant is already set on the connection, so RLS scopes
+   every admin queryset to that tenant automatically -- exactly like the rest of
+   your app. **Do not** wrap a tenant-scoped admin's ``ModelAdmin`` /
+   ``get_queryset`` in ``bypass_rls()``: that would disable isolation and expose
+   every tenant's rows in the admin. Reach for ``bypass_rls()`` only in a
+   *deliberately* cross-tenant admin (a superuser/staff "all tenants" console),
+   and even then scope it to the specific views or querysets that need it.
 
 
 bulk_create and other save()-bypassing paths
@@ -860,6 +872,76 @@ The policy's ``WITH CHECK`` clause still protects you at the database level: an
 is **rejected** by PostgreSQL, even though no exception was raised in Python
 before the query. This is defense in depth -- the database is the source of
 truth for isolation.
+
+
+.. _rls-constraints:
+
+Database constraints and covert channels
+=========================================
+
+RLS policies filter the **rows a query reads and writes**, but PostgreSQL applies
+``UNIQUE``, primary-key and foreign-key **constraint checks with row security
+bypassed**. A constraint check therefore sees *every* tenant's rows, even though
+your queries never can. This is documented behaviour (constraint enforcement is a
+privileged internal operation), and it opens a *covert channel*: an attacker can
+probe for the **existence** of another tenant's value without ever being able to
+read it.
+
+.. danger::
+
+   **A global ``UNIQUE`` constraint leaks cross-tenant existence.** Suppose
+   ``email`` is declared ``unique=True``. Tenant A inserts ``alice@example.com``.
+   Tenant B then tries to insert the *same* address and gets an
+   ``IntegrityError`` -- even though tenant B can never *see* tenant A's row. The
+   error itself confirms that some other tenant already owns that email. The
+   ``UNIQUE`` index spans the whole shared table, so it silently makes a global
+   namespace out of what should be a per-tenant one.
+
+   The fix is to make every uniqueness **tenant-scoped** -- include the tenant
+   column in the constraint so the namespace is per-tenant:
+
+   .. code-block:: python
+
+       from django.db import models
+       from django_tenants.rls.models import TenantRLSModel
+
+       class Contact(TenantRLSModel):
+           # WRONG under RLS: a single global namespace; leaks existence.
+           # email = models.EmailField(unique=True)
+
+           # RIGHT: drop the field-level unique= and scope it to the tenant.
+           email = models.EmailField()
+
+           class Meta:
+               constraints = [
+                   models.UniqueConstraint(
+                       fields=["tenant", "email"],
+                       name="contact_unique_email_per_tenant",
+                   ),
+               ]
+
+   The same applies to ``Meta.unique_together`` and to any
+   ``UniqueConstraint`` -- every uniqueness must list the tenant field. The
+   :ref:`W005 system check <rls-system-checks>` flags any ``unique=True`` field,
+   ``unique_together``, or ``UniqueConstraint`` on a ``TenantRLSModel`` whose
+   field set does **not** include the tenant field.
+
+.. warning::
+
+   **The primary key and cross-model foreign keys are existence-probe surfaces
+   too.** The global ``id`` PK is, by definition, unique across the whole shared
+   table, so an ``INSERT`` that collides with another tenant's ``id`` raises an
+   ``IntegrityError`` that confirms that ``id`` is taken somewhere. Prefer a
+   non-guessable surrogate key (``BigAutoField`` is hard to enumerate; ``UUIDField``
+   removes the channel entirely) and never let a client choose the ``id``.
+
+   Likewise, a ``ForeignKey`` from one ``TenantRLSModel`` to **another**
+   ``TenantRLSModel`` is checked with RLS bypassed: PostgreSQL validates that the
+   referenced row exists across *all* tenants, so a foreign-key violation (or its
+   absence) reveals whether a given pk exists in the referenced table for *some*
+   tenant. Application code should always validate that a referenced object is
+   visible **under the current tenant** before saving, rather than relying on the
+   FK check, and should avoid surfacing the raw database error to the client.
 
 
 Optional fallback middleware
@@ -888,6 +970,131 @@ deployment, however, this middleware is what provides the cross-request bypass
 reset described under :ref:`bypass_rls <bypass-leak-note>` -- do not remove it.
 
 
+.. _rls-cache-storage-celery:
+
+Tenant-aware cache, file storage, and Celery
+============================================
+
+Schema-per-tenant django-tenants ships helpers that key the cache and the file
+storage on ``connection.schema_name``. **Under RLS those helpers collapse all
+tenants together.** The RLS backend keeps the ``search_path`` on ``public`` for
+*every* tenant, so ``connection.schema_name`` is pinned to ``"public"`` and is no
+longer the active tenant. Anything keyed on it -- cache keys, on-disk media
+paths, Celery routing -- silently shares state across tenants.
+
+The real active tenant is still available as ``connection.tenant`` (the RLS
+backend sets it from ``request.tenant`` / ``rls_context`` just like the stock
+backend). The RLS subpackage exposes
+``django_tenants.rls.session.current_tenant_schema(using=None)``, which returns
+``connection.tenant.schema_name`` (falling back to the public schema name when no
+tenant is active). All of the helpers below derive their per-tenant key/path from
+*that* function, **not** from ``connection.schema_name``.
+
+Cache (django-redis)
+--------------------
+
+``django_tenants.rls.cache`` provides drop-in replacements for the
+``django_tenants.cache`` key functions that source the tenant from the real
+tenant rather than ``connection.schema_name``. The key *shape* is identical
+(``"<schema>:<prefix>:<version>:<key>"``), so it is a straight swap:
+
+.. code-block:: python
+
+    CACHES = {
+        "default": {
+            "BACKEND": "django_redis.cache.RedisCache",
+            "LOCATION": "redis://127.0.0.1:6379/1",
+            "KEY_FUNCTION": "django_tenants.rls.cache.make_key",
+            "REVERSE_KEY_FUNCTION": "django_tenants.rls.cache.reverse_key",
+        }
+    }
+
+Without this, two tenants computing the same logical key under RLS would read and
+write the **same** Redis entry (both keyed on ``public:``), leaking cached data
+across tenants.
+
+File storage
+------------
+
+``django_tenants.rls.storage.RLSTenantFileSystemStorage`` mirrors
+``TenantFileSystemStorage`` but builds the per-tenant media path/URL segment from
+``current_tenant_schema()`` instead of ``connection.schema_name``:
+
+.. code-block:: python
+
+    # settings.py (Django >= 4.2 STORAGES form)
+    STORAGES = {
+        "default": {
+            "BACKEND": "django_tenants.rls.storage.RLSTenantFileSystemStorage",
+        },
+        "staticfiles": {
+            "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+        },
+    }
+
+The module also exposes ``rls_parse_tenant_config_path(config_path)`` (the
+RLS-aware analogue of ``django_tenants.utils.parse_tenant_config_path``) and an
+``RLSTenantStorageMixin`` you can mix into any ``Storage`` subclass.
+
+If you store media in S3 via **django-storages**, the subpackage deliberately
+does *not* import ``S3Boto3Storage`` (it is an optional dependency). Apply the
+same override yourself by prepending ``current_tenant_schema()`` to the storage
+``location``:
+
+.. code-block:: python
+
+    from storages.backends.s3boto3 import S3Boto3Storage
+    from django_tenants.rls.session import current_tenant_schema
+
+    class RLSTenantS3Storage(S3Boto3Storage):
+        @property
+        def location(self):
+            base = super().location or ""
+            return "/".join(s for s in (current_tenant_schema(), base.strip("/")) if s)
+
+Celery (out-of-request tasks)
+-----------------------------
+
+A Celery worker runs **outside** the request cycle, so nothing sets (or clears)
+the tenant GUC for it. Two failure modes follow: a task can run with **no**
+tenant set (RLS makes every row invisible), or -- worse, on a reused worker
+connection -- it can **inherit the previous task's tenant** and read/write the
+wrong tenant's data.
+
+The rule is therefore: **every task must wrap its own database work in a tenant
+context**, exactly as a script would:
+
+.. code-block:: python
+
+    from django_tenants.rls.session import rls_context, bypass_rls
+
+    @app.task
+    def rebuild_report(tenant_id):
+        with rls_context(tenant_id):       # accepts a tenant instance or a bare pk
+            ...                            # all DB work scoped to this tenant
+        # for deliberate cross-tenant work use bypass_rls() instead
+
+To guarantee a task can never *silently inherit* a prior task's tenant on a
+pooled worker connection, register the shipped signal handlers, which reset the
+connection to the secure default (no tenant, bypass off) before and after every
+task:
+
+.. code-block:: python
+
+    # In your Celery app setup (e.g. celery.py), after the app is created:
+    from django_tenants.rls.celery import register
+
+    register()   # connects task_prerun / task_postrun handlers
+
+``register()`` lazily imports ``celery.signals`` and raises
+``ImproperlyConfigured`` if Celery is not installed. The handlers only enforce
+the secure *default* (they call ``clear_current_tenant()`` and
+``set_bypass(False)``); they do **not** activate a tenant for you. Each task is
+still responsible for its own ``rls_context(tenant)`` (or ``bypass_rls()``)
+block -- the handlers simply ensure that a task that forgets to do so sees *no*
+rows rather than the wrong tenant's rows.
+
+
 .. _rls-system-checks:
 
 System checks
@@ -914,6 +1121,26 @@ With ``django_tenants.rls`` installed and ``TENANT_RLS_ENABLED`` on, Django's
   ``check`` it cannot inspect the role and stays silent (it can neither confirm
   nor block). It runs with the ``database`` tag (e.g. during ``migrate`` or
   ``manage.py check --database default``).
+* **W004** -- *RLS-live drift.* For each concrete ``TenantRLSModel`` the check
+  introspects the database (on the tenant alias) and warns when the table's
+  protections do not actually match the configuration: RLS is **not enabled**
+  (``pg_class.relrowsecurity`` is false), RLS is **not forced** while
+  ``TENANT_RLS_FORCE`` is on (``relforcerowsecurity`` is false), there is **no
+  policy** on the table (no ``pg_policies`` row), or the tenant column
+  (``<tenant_field>_id``) is **nullable** (so NULL-tenant rows could exist).
+  This catches the gap where ``migrate`` exited 0 but a model's
+  :ref:`auto-enable hook failed <rls-step-6-enable>`, or where someone disabled a
+  policy out of band. It runs with the ``database`` tag and is **best-effort**:
+  any database error (not reachable, not PostgreSQL, table not created yet)
+  yields no findings rather than a false alarm.
+* **W005** -- *unique-without-tenant.* A model-level check (no database access)
+  that flags any ``unique=True`` field, ``Meta.unique_together`` set, or
+  ``Meta.constraints`` ``UniqueConstraint`` on a ``TenantRLSModel`` whose field
+  set does **not** include the tenant field. PostgreSQL evaluates ``UNIQUE``
+  checks with row security bypassed, so a global uniqueness leaks cross-tenant
+  existence (see :ref:`Database constraints and covert channels
+  <rls-constraints>`). The hint is to scope the constraint to the tenant, e.g.
+  ``UniqueConstraint(fields=["tenant", ...])``.
 * **E001** -- the session/bypass variable name is not a valid PostgreSQL GUC
   variable name (it must be of the form ``<class>.<name>``).
 * **E002** -- the tenant model's primary-key type cannot be mapped to a
@@ -922,6 +1149,20 @@ With ``django_tenants.rls`` installed and ``TENANT_RLS_ENABLED`` on, Django's
   <rls-pk-types>`. The hint names the unmappable internal field type.
 
 Checks only fire when RLS is enabled, so disabled installs see nothing.
+
+For CI, the bundled ``verify_rls`` management command runs the same per-model
+introspection as **W004** against a live database and exits non-zero if *any*
+model's table has a gap (RLS off, not forced, no policy, or a nullable tenant
+column), printing ``OK`` / ``PROBLEM`` per model with specifics:
+
+.. code-block:: bash
+
+    python manage.py verify_rls                 # uses the tenant database alias
+    python manage.py verify_rls --database default
+
+Unlike the best-effort W004 check (which stays silent when it cannot introspect),
+``verify_rls`` is meant to **fail the build**, so wire it into your deploy/CI
+pipeline after migrations to catch RLS-live drift before it reaches production.
 
 
 .. _rls-pk-types:
@@ -1027,6 +1268,43 @@ or a pooled connection cannot inherit a stale tenant/bypass) -- and it is the
 deliberate cost of database-enforced isolation. When ``TENANT_RLS_ENABLED`` is
 ``False`` the backend emits **nothing** extra and behaves byte-for-byte like the
 stock django-tenants backend.
+
+**Policy evaluation (InitPlan).** The ``TenantPolicy`` expression wraps each
+``current_setting()`` call in a scalar sub-SELECT::
+
+    (tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', true), '')::integer)
+     OR (SELECT current_setting('django_tenants.bypass_rls', true)) = 'on')
+
+The sub-SELECT lets PostgreSQL evaluate the session variables **once per
+statement** (as an *InitPlan*) instead of once per row. On large shared tables a
+bare ``current_setting()`` in the policy would be re-evaluated for every scanned
+row, which is a significant, easy-to-miss cost; the InitPlan form removes it.
+
+**Index the tenant column.** Because every policed query is effectively filtered
+by ``tenant_id``, add an index that leads with it. A composite index that starts
+with ``tenant_id`` and continues with your common filter/order columns lets a
+single index serve both the policy and the query:
+
+.. code-block:: python
+
+    class Note(TenantRLSModel):
+        text = models.TextField()
+        created_at = models.DateTimeField(auto_now_add=True)
+
+        class Meta:
+            indexes = [
+                models.Index(fields=["tenant", "created_at"]),
+            ]
+
+.. note::
+
+   The policy is ``tenant_id = ... OR bypass = 'on'``. That ``OR`` bypass
+   disjunct can stop the planner from choosing a pure ``tenant_id`` index scan on
+   an **unfiltered** scan such as ``.all()`` or ``.count()`` (the planner must
+   account for the bypass branch). Queries that add their own selective
+   ``WHERE``/``ORDER BY`` still use the composite index normally; this only
+   affects whole-table scans, where a sequential scan is often the right plan
+   anyway.
 
 
 Example project
