@@ -20,7 +20,7 @@ from contextlib import ContextDecorator
 from django.db import connections
 
 from django_tenants.postgresql_backend.base import DatabaseError, psycopg
-from django_tenants.utils import get_tenant_database_alias
+from django_tenants.utils import get_public_schema_name, get_tenant_database_alias
 
 from . import conf
 
@@ -36,6 +36,22 @@ def _resolve_connection(using):
     if using is None:
         using = get_tenant_database_alias()
     return connections[using]
+
+
+def current_tenant_schema(using=None):
+    """
+    Return the schema name of the REAL active tenant on the ``using`` alias
+    (defaulting to the tenant database alias).
+
+    Under shared-schema RLS, ``connection.schema_name`` is pinned to ``public``
+    for every tenant, so anything keyed on it (cache keys, file storage paths)
+    would collapse and leak across tenants. The actual tenant is still tracked on
+    ``connection.tenant``, so we read its ``schema_name`` here; if no tenant is
+    set (or it has no ``schema_name``, e.g. a FakeTenant) we fall back to the
+    public schema name. ``cache.py`` and ``storage.py`` key on this helper.
+    """
+    connection = _resolve_connection(using)
+    return getattr(getattr(connection, "tenant", None), "schema_name", None) or get_public_schema_name()
 
 
 def _coerce_tenant_id(tenant_or_id):

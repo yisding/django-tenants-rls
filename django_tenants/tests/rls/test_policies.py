@@ -25,10 +25,13 @@ class TenantPolicySQLTestCase(unittest.TestCase):
             bypass_variable="django_tenants.bypass_rls",
             pk_cast="integer",
         )
+        # DEC-1: each current_setting() is wrapped in a scalar sub-SELECT so
+        # Postgres evaluates it once per statement (InitPlan), not once per row.
         self.assertEqual(
             policy.get_sql_expression(),
-            "(tenant_id = NULLIF(current_setting('django_tenants.tenant_id', true), "
-            "'')::integer OR current_setting('django_tenants.bypass_rls', true) = 'on')",
+            "(tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', "
+            "true), '')::integer) OR (SELECT current_setting('django_tenants.bypass_rls', "
+            "true)) = 'on')",
         )
 
     def test_uuid_cast_expression(self):
@@ -41,8 +44,9 @@ class TenantPolicySQLTestCase(unittest.TestCase):
         )
         self.assertEqual(
             policy.get_sql_expression(),
-            "(tenant_id = NULLIF(current_setting('django_tenants.tenant_id', true), "
-            "'')::uuid OR current_setting('django_tenants.bypass_rls', true) = 'on')",
+            "(tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', "
+            "true), '')::uuid) OR (SELECT current_setting('django_tenants.bypass_rls', "
+            "true)) = 'on')",
         )
 
     def test_custom_field_and_variable_names(self):
@@ -55,9 +59,39 @@ class TenantPolicySQLTestCase(unittest.TestCase):
         )
         self.assertEqual(
             policy.get_sql_expression(),
-            "(organisation_id = NULLIF(current_setting('myapp.org', true), "
-            "'')::bigint OR current_setting('myapp.bypass', true) = 'on')",
+            "(organisation_id = (SELECT NULLIF(current_setting('myapp.org', true), "
+            "'')::bigint) OR (SELECT current_setting('myapp.bypass', true)) = 'on')",
         )
+
+    def test_current_setting_is_initplan_wrapped(self):
+        # DEC-1: both current_setting() calls must sit inside a scalar
+        # sub-SELECT (the InitPlan-once-per-statement optimisation). Assert the
+        # structural markers so a regression that drops the wrapping is caught
+        # independently of exact whitespace.
+        policy = TenantPolicy(
+            name="note_isolation",
+            tenant_field="tenant",
+            session_variable="django_tenants.tenant_id",
+            bypass_variable="django_tenants.bypass_rls",
+            pk_cast="integer",
+        )
+        expr = policy.get_sql_expression()
+        # The tenant comparison reads the GUC through a sub-SELECT.
+        self.assertIn(
+            "(SELECT NULLIF(current_setting('django_tenants.tenant_id', true), "
+            "'')::integer)",
+            expr,
+        )
+        # The bypass disjunct reads its GUC through a sub-SELECT too.
+        self.assertIn(
+            "(SELECT current_setting('django_tenants.bypass_rls', true)) = 'on'",
+            expr,
+        )
+        # No *bare* current_setting( should survive: every occurrence must be
+        # immediately preceded by "(SELECT ". There are exactly two GUC reads.
+        self.assertEqual(expr.count("current_setting("), 2)
+        self.assertEqual(expr.count("(SELECT current_setting("), 1)
+        self.assertEqual(expr.count("(SELECT NULLIF(current_setting("), 1)
 
     def test_using_and_check_are_identical_for_all(self):
         policy = TenantPolicy(

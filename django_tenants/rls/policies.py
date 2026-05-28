@@ -192,10 +192,12 @@ class TenantPolicy(BasePolicy):
 
     The rendered SQL compares the row's tenant FK column against the tenant
     session variable, OR allows everything when the bypass session variable is
-    ``on``::
+    ``on``. Each ``current_setting()`` call is wrapped in a scalar sub-SELECT so
+    Postgres evaluates it once per statement as an InitPlan, not once per row
+    (a major win on large shared tables)::
 
-        (tenant_id = NULLIF(current_setting('django_tenants.tenant_id', true), '')::integer
-         OR current_setting('django_tenants.bypass_rls', true) = 'on')
+        (tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', true), '')::integer)
+         OR (SELECT current_setting('django_tenants.bypass_rls', true)) = 'on')
 
     With no tenant set (the session variable is empty/unset), ``NULLIF('', '')``
     yields ``NULL`` and the comparison is ``NULL`` (not true), so no rows are
@@ -248,10 +250,13 @@ class TenantPolicy(BasePolicy):
             )
 
     def get_sql_expression(self):
+        # Each current_setting() is wrapped in a scalar sub-SELECT so Postgres
+        # evaluates it once per statement (an InitPlan) rather than once per row.
+        # On large shared tables this is a major performance win; the semantics
+        # are identical to the bare calls.
         return (
-            "(%s_id = "
-            "NULLIF(current_setting(%s, true), '')::%s"
-            " OR current_setting(%s, true) = 'on')"
+            "(%s_id = (SELECT NULLIF(current_setting(%s, true), '')::%s)"
+            " OR (SELECT current_setting(%s, true)) = 'on')"
             % (
                 self.tenant_field,
                 _q(self.session_variable),

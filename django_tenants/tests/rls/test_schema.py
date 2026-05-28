@@ -91,10 +91,10 @@ class CreatePolicyTestCase(unittest.TestCase):
         expected = (
             'CREATE POLICY "rls_note_tenant_isolation" ON "rls_note" '
             "AS PERMISSIVE FOR ALL TO public "
-            "USING ((tenant_id = NULLIF(current_setting('django_tenants.tenant_id', true), "
-            "'')::integer OR current_setting('django_tenants.bypass_rls', true) = 'on')) "
-            "WITH CHECK ((tenant_id = NULLIF(current_setting('django_tenants.tenant_id', true), "
-            "'')::integer OR current_setting('django_tenants.bypass_rls', true) = 'on'))"
+            "USING ((tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', true), "
+            "'')::integer) OR (SELECT current_setting('django_tenants.bypass_rls', true)) = 'on')) "
+            "WITH CHECK ((tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', true), "
+            "'')::integer) OR (SELECT current_setting('django_tenants.bypass_rls', true)) = 'on'))"
         )
         self.assertEqual(self.se.executed, [expected])
 
@@ -143,10 +143,10 @@ class AlterPolicyTestCase(unittest.TestCase):
         self.se.alter_policy(self.model, _tenant_policy())
         expected = (
             'ALTER POLICY "rls_note_tenant_isolation" ON "rls_note" '
-            "USING ((tenant_id = NULLIF(current_setting('django_tenants.tenant_id', true), "
-            "'')::integer OR current_setting('django_tenants.bypass_rls', true) = 'on')) "
-            "WITH CHECK ((tenant_id = NULLIF(current_setting('django_tenants.tenant_id', true), "
-            "'')::integer OR current_setting('django_tenants.bypass_rls', true) = 'on'))"
+            "USING ((tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', true), "
+            "'')::integer) OR (SELECT current_setting('django_tenants.bypass_rls', true)) = 'on')) "
+            "WITH CHECK ((tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', true), "
+            "'')::integer) OR (SELECT current_setting('django_tenants.bypass_rls', true)) = 'on'))"
         )
         self.assertEqual(self.se.executed, [expected])
 
