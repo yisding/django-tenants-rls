@@ -216,3 +216,20 @@ class BypassRlsContextTestCase(_PatchResolveMixin):
         except ValueError:
             pass
         self.assertFalse(session.get_bypass(connection=self.conn))
+
+
+class ConnectionOptionalTestCase(_PatchResolveMixin):
+    """``connection`` is optional on set_current_tenant; it resolves from ``using``.
+
+    The public helper documents ``set_current_tenant(tenant_id=...)`` /
+    ``set_current_tenant(using=..., tenant_id=...)``; these must not raise a
+    TypeError for a missing positional ``connection``.
+    """
+
+    def test_connection_omitted_resolves_from_using(self):
+        session.set_current_tenant(tenant_id=7)
+        self.assertEqual(self.conn.store["django_tenants.tenant_id"], "7")
+
+    def test_connection_none_keyword(self):
+        session.set_current_tenant(connection=None, tenant_id=9)
+        self.assertEqual(self.conn.store["django_tenants.tenant_id"], "9")

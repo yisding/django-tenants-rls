@@ -1,6 +1,6 @@
 """Management command to disable RLS and policies on TenantRLSModel subclasses."""
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 
 
 class Command(BaseCommand):
@@ -29,6 +29,7 @@ class Command(BaseCommand):
             ))
             return
 
+        failures = []
         for model in models:
             try:
                 model.disable_rls()
@@ -36,9 +37,19 @@ class Command(BaseCommand):
                     "Disabled RLS for %s" % model._meta.label
                 ))
             except Exception as e:
+                # Record so the command exits non-zero: rollback/maintenance
+                # automation must be able to detect an incomplete disable (a
+                # policy or FORCE ROW LEVEL SECURITY may still be in place).
+                failures.append((model._meta.label, e))
                 self.stderr.write(self.style.ERROR(
                     "Failed to disable RLS for %s: %s" % (model._meta.label, e)
                 ))
+
+        if failures:
+            raise CommandError(
+                "RLS could not be disabled for %d model(s): %s"
+                % (len(failures), ", ".join(label for label, _ in failures))
+            )
 
     def _get_models(self, app_label, model_name):
         from django.apps import apps
