@@ -4,6 +4,10 @@ All checks are gated on ``conf.rls_enabled()`` so that installs which have not
 opted into RLS see no warnings or errors at all. The checks are registered via
 the ``@register`` decorators below; they are wired into Django by importing this
 module from ``DjangoTenantsRLSConfig.ready()``.
+
+The production-relevant checks (W001, W003, W004, W005, E002) are registered
+with ``deploy=True`` so they also run under ``manage.py check --deploy`` (and
+are CI-usable alongside ``rls_doctor``); E001/W002 stay non-deploy.
 """
 
 from django.core.checks import Error, Tags, Warning, register
@@ -166,7 +170,7 @@ def _engine_is_rls_backend(engine):
     return False
 
 
-@register(Tags.database)
+@register(Tags.database, deploy=True)
 def check_rls_backend(app_configs, **kwargs):
     """Warn when RLS is enabled but nothing will actually apply the policies.
 
@@ -210,7 +214,7 @@ def check_rls_backend(app_configs, **kwargs):
     return errors
 
 
-@register(Tags.database)
+@register(Tags.database, deploy=True)
 def check_rls_role(app_configs, **kwargs):
     """Error when the tenant DB role bypasses RLS (superuser or BYPASSRLS).
 
@@ -322,7 +326,7 @@ def check_rls_var_names(app_configs, **kwargs):
     return errors
 
 
-@register()
+@register(deploy=True)
 def check_tenant_pk_cast(app_configs, **kwargs):
     """Error when the tenant model PK type cannot be cast for the RLS comparison.
 
@@ -400,7 +404,7 @@ def check_tenant_field(app_configs, **kwargs):
     return errors
 
 
-@register(Tags.database)
+@register(Tags.database, deploy=True)
 def check_rls_live(app_configs, **kwargs):
     """Warn when RLS is not actually LIVE on a tenant table (drift detection).
 
@@ -488,7 +492,7 @@ def _unique_fieldsets(model):
             )
 
 
-@register()
+@register(deploy=True)
 def check_tenant_unique_constraints(app_configs, **kwargs):
     """Warn about UNIQUE constraints on a TenantRLSModel that omit the tenant.
 

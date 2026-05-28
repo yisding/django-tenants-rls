@@ -464,6 +464,16 @@ checklist you complete *and write down* before touching code.
    backfill, and enable steps come in later sections; here you are only
    gathering facts and classifying.
 
+.. tip::
+
+   You do not have to gather all of this by hand. ``manage.py rls_doctor``
+   scans your project and database for readiness, can **auto-enable RLS on
+   tables you have already backfilled** (the one provably-safe step), and
+   **generates migration/SQL scaffolds** for the rest -- while only *advising*
+   on the dangerous steps such as the cross-schema backfill. It is the quickest
+   way to turn this assessment into a concrete plan. See
+   :ref:`rls-migration-assistant`.
+
 Step 1 -- Classify every app: tenant-isolated, shared, or RLS
 -------------------------------------------------------------
 

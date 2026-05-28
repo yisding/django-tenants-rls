@@ -70,6 +70,7 @@ include = [
 
 [tool.setuptools.package-data]
 "django_tenants" = [ "templates/**/*.html" ]
+"django_tenants.rls" = [ "templates/**/*.html" ]
 "docs" = [ "**/*" ]
 "examples" = [ "**/*" ]
 "dts_test_project" = [ "**/*" ]

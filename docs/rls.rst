@@ -1188,6 +1188,241 @@ tenant model. The cast is deliberately **not** allowed to silently fall back to
 the misconfiguration is surfaced loudly instead.
 
 
+.. _rls-checks-deploy:
+
+Running the checks under ``manage.py check --deploy``
+-----------------------------------------------------
+
+The production-relevant RLS checks are tagged ``deploy=True``, so they also run
+under Django's deployment check::
+
+    python manage.py check --deploy --database default
+
+``--deploy`` turns on the deployment-only check set (it normally also surfaces
+Django's own production warnings). The RLS checks that run under it are the ones
+that catch a *fail-open* or drifted deployment: **W001** (RLS enabled but no
+enforcer wired up), **W003** (the connecting role bypasses RLS -- an Error),
+**W004** (RLS not actually live on a tenant table), **W005** (a ``UNIQUE``
+constraint that omits the tenant), and **E002** (an uncastable tenant PK type).
+Wiring ``check --deploy`` into CI means these run automatically on every deploy,
+not only when someone passes ``--database``. The model-level checks (W002, W005,
+E001) need no database; W003/W004 connect on the tenant alias and stay
+best-effort (silent) when the database is unreachable or is not PostgreSQL (see
+:ref:`rls-system-checks`).
+
+
+.. _rls-migration-assistant:
+
+Migration assistant (``rls_doctor``)
+====================================
+
+Adopting shared-schema RLS on an **existing, populated** django-tenants
+deployment is a multi-step migration (configuration cutover, moving apps to
+``SHARED_APPS``, adding the staged tenant FK, backfilling, tightening to
+``NOT NULL``, enabling RLS + policies, third-party model policies, fixing
+tenant-omitting ``UNIQUE`` constraints, and decommissioning old schemas -- the
+full sequence is in :doc:`rls_migration`). The bundled ``rls_doctor`` management
+command is a **readiness assistant** for that journey: it *scans* your project
+and database, *auto-applies* only the one provably-safe step, *generates*
+migration/SQL scaffolds for the steps that need a migration, and *advises* (but
+never runs) the dangerous, app-specific steps.
+
+``rls_doctor`` does **not** reimplement any RLS primitive. It composes the
+existing :ref:`system checks <rls-system-checks>`, the per-model live
+introspection behind **W004**, ``TenantRLSModel.has_unscoped_rows()``, and
+``model.enable_rls()`` -- so what it reports and what it fixes are exactly what
+the rest of the subpackage already enforces.
+
+What it scans and classifies
+----------------------------
+
+The command runs ``django_tenants.rls.doctor.scan()``, which collects two kinds
+of finding:
+
+* **Settings findings.** It re-runs the configuration checks (the ENGINE/W001
+  enforcer wiring, the role/W003 bypass check, the GUC-name/E001 check, and the
+  PK-cast/E002 check) and adds two lightweight introspections: a **cache**
+  finding when a ``CACHES[*]["KEY_FUNCTION"]`` still resolves to the
+  ``schema_name``-based ``django_tenants.cache.make_key`` (it advises switching
+  to ``django_tenants.rls.cache.make_key``), and a **storage** finding when the
+  default storage is the schema-based ``TenantFileSystemStorage`` (it advises
+  ``RLSTenantFileSystemStorage``). See
+  :ref:`rls-cache-storage-celery` for why those helpers collapse all tenants
+  together under RLS.
+* **Model findings.** For every concrete ``TenantRLSModel`` it assigns one
+  **classification**:
+
+  .. list-table::
+     :header-rows: 1
+     :widths: 22 78
+
+     * - Classification
+       - Meaning (and the migration step it maps to)
+     * - ``done``
+       - RLS is fully live for this table (the W004 live-introspection is
+         clean): RLS enabled, forced when ``TENANT_RLS_FORCE`` is on, a policy
+         present, and the tenant column ``NOT NULL``. Nothing to do.
+     * - ``auto_fixable``
+       - The table has the tenant column, it is ``NOT NULL``, and there are
+         **no** un-scoped (``NULL`` ``tenant_id``) rows -- but RLS / FORCE / the
+         policy are not on yet. This is the **one safe step**: ``--fix`` will
+         call ``model.enable_rls()`` (migration **Step 6**).
+     * - ``generate_migration``
+       - A migration/scaffold is needed: the tenant FK is missing, the tenant
+         column is still nullable, or a ``UNIQUE`` constraint omits the tenant
+         (migration **Steps 3 / 5 / 8**). ``--generate`` writes a scaffold.
+     * - ``manual``
+       - Needs human action that must **not** be auto-run: the table still has
+         un-scoped (``NULL`` ``tenant_id``) rows that require an app-specific
+         backfill (migration **Step 4**), or app-side cache/storage code must be
+         re-pointed.
+     * - ``blocked``
+       - The connecting role bypasses RLS (**W003**), so enforcement would be
+         theatre. Surfaced loudly, and ``--fix`` refuses to run.
+
+  ``scan()`` is **best-effort** on database access: a model whose table is
+  missing, or an unreachable database, degrades to a finding rather than raising.
+
+The scan result is the single source of truth for the report, the ``--fix``
+decision, the admin dashboard, and the ``--format json`` output. A small helper
+``django_tenants.rls.doctor.classify_model(model, connection, *, force)`` returns
+``(classification, problems)`` and is reused by the command and the admin view.
+
+The default report
+------------------
+
+With no flags the command prints a readable report grouped by classification.
+Each non-``done`` item names its problem, the remedy, and the migration step to
+read (``see docs/rls_migration.rst step N``)::
+
+    python manage.py rls_doctor
+    python manage.py rls_doctor --database default   # default is the tenant alias
+
+**Exit code (CI-usable).** A scan-only run exits ``0`` only when there are
+**zero** non-``done`` model items **and** no error-level settings findings;
+otherwise it exits ``1``. That makes ``rls_doctor`` safe to gate a pipeline on.
+
+``--fix``: apply only the safe slice
+------------------------------------
+
+``--fix`` re-applies the single provably-safe step and nothing else. It enables
+RLS (via ``model.enable_rls()``) **only** for models classified
+``auto_fixable``, then re-scans and re-reports using the same exit-code rule::
+
+    python manage.py rls_doctor --fix
+
+It deliberately **refuses** (prints a clear message and exits non-zero, applying
+nothing) in two cases:
+
+* **The role bypasses RLS** -- ``scan()["blocked"]`` is ``True`` (the W003
+  Error). Enabling RLS while the role bypasses it would create policies that do
+  nothing; fix the role first (see :ref:`rls-database-role`).
+* **A target model still has un-scoped rows** -- ``model.has_unscoped_rows()``
+  is ``True``. Enabling RLS now would make those ``NULL`` ``tenant_id`` rows
+  invisible to every tenant (see :ref:`rls-null-rows`). Backfill first (migration
+  **Step 4**).
+
+``--fix`` **never** runs a backfill, a ``SET NOT NULL``, a ``DROP SCHEMA``, or
+any DDL beyond that safe enable path. The dangerous steps stay yours to run
+deliberately.
+
+.. note::
+
+   ``ALTER TABLE ... ENABLE ROW LEVEL SECURITY`` requires the connecting role to
+   **own** the table -- which is the expected setup, since the application role
+   owns its tenant tables so ``FORCE ROW LEVEL SECURITY`` polices it. If you have
+   instead granted the app role only DML (no ownership), ``--fix`` cannot enable
+   RLS for you (Postgres returns ``must be owner of table``); it reports the
+   failure and leaves the scan red. Run ``enable_rls`` (or the generated
+   ``EnableRLS`` migration) as the table owner / a migration role instead.
+
+``--generate``: write migration / SQL scaffolds
+-----------------------------------------------
+
+``--generate`` writes scaffold files for every ``generate_migration`` item and
+prints each path. It writes into a scratch directory (default
+``./rls_migrations_scaffold/``) -- **never** into a real ``migrations/``
+directory -- and it never applies anything::
+
+    python manage.py rls_doctor --generate
+    python manage.py rls_doctor --generate ./my_scaffolds/
+
+The generators live in ``django_tenants.rls.scaffold`` and all return strings
+(they write nothing themselves):
+
+* ``staged_fk_migration(model)`` -- a migration that adds the tenant FK as
+  ``null=True``, a commented ``RunPython`` backfill **stub**, and a clearly
+  delimited ``AlterField`` to ``null=False`` gated by a TODO to run only **after**
+  the backfill (migration **Steps 3 / 5**).
+* ``enable_rls_migration(model)`` -- a migration using
+  ``operations.EnableRLS`` + ``operations.CreateTenantPolicy`` (migration
+  **Step 6**).
+* ``third_party_policy_sql(table, *, pk_cast="integer")`` -- raw
+  ``ENABLE``/``FORCE``/``CREATE POLICY`` DDL for a table you cannot subclass
+  (for example ``authtoken_token``). Its ``USING`` / ``WITH CHECK`` is built from
+  ``policies.TenantPolicy`` so it is byte-identical to the framework policy
+  (migration **Step 7**).
+* ``unique_constraint_migration(model, fields)`` -- an ``AddConstraint`` of a
+  tenant-scoped ``UniqueConstraint([tenant_field, *fields])`` plus a
+  ``RemoveConstraint`` of the old one (migration **Step 8**).
+
+Each generated migration is valid Python you review and drop into the right
+app's ``migrations/`` directory yourself; the backfill stub is intentionally a
+TODO, because the correct backfill is app-specific (see
+:ref:`rls-backfill-recipe`).
+
+``--format json``: machine-readable output
+------------------------------------------
+
+For tooling, ``--format json`` dumps the full ``scan()`` dict (settings, models,
+summary, ``blocked``) so a pipeline can parse it instead of scraping the report::
+
+    python manage.py rls_doctor --format json
+
+Using it in CI
+--------------
+
+``rls_doctor`` complements the existing CI guards rather than replacing them. A
+robust pipeline runs all three after migrations:
+
+#. ``manage.py check --deploy --database default`` -- the deploy-tagged checks
+   (W001/W003/W004/W005/E002; see :ref:`rls-checks-deploy`) fail the build on a
+   mis-wired or fail-open configuration.
+#. ``manage.py rls_doctor`` -- exits non-zero while any model is not yet
+   ``done`` (or any settings finding is error-level), so a half-finished
+   migration cannot pass unnoticed.
+#. ``manage.py verify_rls`` -- the live per-model W004 introspection that is
+   *meant* to fail the build on RLS-live drift (see :ref:`rls-system-checks`).
+
+The optional read-only admin dashboard
+---------------------------------------
+
+For a browser view of the same readiness data, the subpackage ships an
+**optional, read-only** admin dashboard. It is not auto-registered; wire it in
+explicitly (for example from your project's admin setup)::
+
+    from django_tenants.rls.admin import register_rls_admin
+
+    register_rls_admin()        # defaults to django.contrib.admin.site
+
+This adds a single guarded page (``rls_readiness_view``) -- staff-only, behind
+``admin_site.admin_view`` and ``never_cache`` -- that calls the same
+``doctor.scan()`` and renders a summary, the per-model classification table, the
+settings findings, copy-paste ``manage.py`` commands, and links back to this
+guide and :doc:`rls_migration`.
+
+.. important::
+
+   **The dashboard is read-only by design: there is never an "apply", "migrate",
+   or "fix" button, and the view has no POST handling.** It may *display* the
+   generated plan, but it executes nothing. The rationale is the same
+   least-privilege principle the rest of RLS mode depends on: your application
+   role is ``NOSUPERUSER NOBYPASSRLS`` and must not run DDL (enabling RLS,
+   altering columns, dropping schemas) from a web request. Run ``rls_doctor``
+   (and migrations) from a deliberate, privileged context on the command line;
+   use the dashboard only to *observe* readiness.
+
+
 RLS settings reference
 ======================
 
