@@ -112,15 +112,18 @@ def _fetch_guarded(connection, sql, params):
     return row[0]
 
 
-def set_current_tenant(connection, tenant_id, using=None):
+def set_current_tenant(connection=None, tenant_id=None, using=None):
     """
     Set the current-tenant session variable on ``connection``.
 
     ``tenant_id`` may be a tenant instance, a raw pk, or None (None / pk-less
     instances store the empty-string sentinel, making rows invisible).
 
-    Uses ``connection`` if given, else the connection resolved from ``using``
-    (defaulting to the tenant database alias).
+    ``connection`` is optional: when it is None the connection is resolved from
+    ``using`` (defaulting to the tenant database alias). This makes the documented
+    forms -- ``set_current_tenant(tenant_id=tenant.pk)`` and
+    ``set_current_tenant(using="other", tenant_id=...)`` -- work, while the
+    positional ``set_current_tenant(conn, value)`` form keeps working too.
     """
     if connection is None:
         connection = _resolve_connection(using)

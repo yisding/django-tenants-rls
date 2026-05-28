@@ -150,7 +150,14 @@ class BasePolicy(ABC):
         raise NotImplementedError
 
     def get_using_expression(self):
-        """Return the ``USING`` clause expression, or None for no clause."""
+        """Return the ``USING`` clause expression, or None for no clause.
+
+        Returns None for an ``INSERT`` policy: PostgreSQL rejects a ``USING``
+        clause on ``FOR INSERT`` (only ``WITH CHECK`` is valid there), so an
+        INSERT-only policy must rely on :meth:`get_check_expression` instead.
+        """
+        if self.operation == self.INSERT:
+            return None
         return self.get_sql_expression()
 
     def get_check_expression(self):

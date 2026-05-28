@@ -1,6 +1,6 @@
 """Management command to enable RLS and policies on TenantRLSModel subclasses."""
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 
 
 class Command(BaseCommand):
@@ -36,6 +36,7 @@ class Command(BaseCommand):
             ))
             return
 
+        failures = []
         for model in models:
             try:
                 if model.has_unscoped_rows():
@@ -52,9 +53,21 @@ class Command(BaseCommand):
                     "Enabled RLS for %s" % model._meta.label
                 ))
             except Exception as e:
+                # Keep going so a single bad model does not hide the rest, but
+                # record the failure so the command exits non-zero (below).
+                failures.append((model._meta.label, e))
                 self.stderr.write(self.style.ERROR(
                     "Failed to enable RLS for %s: %s" % (model._meta.label, e)
                 ))
+
+        if failures:
+            # Exit non-zero (CommandError) so deploy/migration automation that
+            # runs this command does NOT proceed believing RLS is enabled when one
+            # or more tables were left unprotected.
+            raise CommandError(
+                "RLS could not be enabled for %d model(s): %s"
+                % (len(failures), ", ".join(label for label, _ in failures))
+            )
 
     def _get_models(self, app_label, model_name):
         from django.apps import apps
