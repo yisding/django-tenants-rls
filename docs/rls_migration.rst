@@ -178,10 +178,13 @@ variable (a GUC), *or* admits everything when an explicit bypass GUC is ``on``.
 The policy is built automatically for every ``TenantRLSModel`` by
 ``TenantPolicy.get_sql_expression()`` and reads, in full::
 
-    (tenant_id = NULLIF(current_setting('django_tenants.tenant_id', true), '')::integer
-     OR current_setting('django_tenants.bypass_rls', true) = 'on')
+    (tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', true), '')::integer)
+     OR (SELECT current_setting('django_tenants.bypass_rls', true)) = 'on')
 
-The cast (here ``::integer``) is chosen from your tenant primary-key type. The
+This is the exact expression ``TenantPolicy`` renders, not a simplification:
+each ``current_setting()`` is wrapped in a scalar sub-SELECT so PostgreSQL
+evaluates it once per statement (an InitPlan) instead of once per row. The cast
+(here ``::integer``) is chosen from your tenant primary-key type. The
 step-by-step request flow, the exact GUC names, and the secure-by-default
 reasoning are documented once in :ref:`rls-mechanism`; this guide does not
 reproduce them.
@@ -394,17 +397,28 @@ rationale live in :ref:`rls-database-role`; the essentials are:
     ALTER DEFAULT PRIVILEGES IN SCHEMA public
         GRANT USAGE, SELECT ON SEQUENCES TO app_rls;
 
-Then point ``DATABASES['default']['USER']`` at that role (``app_rls`` above) --
-**not** at ``postgres`` or any other superuser. Run your migrations and
-``manage.py`` admin work under the separate superuser; serve tenant traffic
-only under ``app_rls``.
+Then point ``DATABASES['default']['USER']`` for **tenant traffic** at that role
+(``app_rls`` above) -- **not** at ``postgres`` or any other superuser.
+
+Migrations and other ``manage.py`` work need a more privileged role than
+``app_rls`` (creating tables and running ``ENABLE`` / ``FORCE ROW LEVEL
+SECURITY`` requires *owning* the table). Use a role that **owns** the tenant
+tables and can run DDL but is **not** a superuser and does **not** carry
+``BYPASSRLS`` -- such a role can migrate *and* passes the W003 check below. Do
+**not** run checked commands (``migrate`` runs the system checks) as a
+superuser: with ``TENANT_RLS_ENABLED`` on, W003 is an Error and will fail the
+command. If your only migration role is a superuser, run those commands with a
+migration-only settings module that sets ``TENANT_RLS_ALLOW_BYPASS_ROLE = True``
+(and never serve tenant traffic with that settings/role).
 
 .. note::
 
-   This is a change from how many schema-per-tenant deployments run today,
-   where the app often connects as a privileged role. In RLS mode that
-   privileged role would bypass every policy. Provisioning ``app_rls`` and
-   re-pointing ``USER`` is a prerequisite, not an optional hardening step.
+   This is a change from how many schema-per-tenant deployments run today, where
+   the app often connects as a single privileged (often superuser) role. In RLS
+   mode a superuser/BYPASSRLS role bypasses every policy, and W003 blocks checked
+   commands run as one. Provisioning a non-superuser ``app_rls`` for tenant
+   traffic, plus a non-superuser owner role (or the opt-out settings) for
+   migrations, is a prerequisite -- not optional hardening.
 
 The W003 safety net blocks startup
 -----------------------------------
@@ -1088,33 +1102,46 @@ guide.
 The ``TENANT_MODEL`` app (e.g. ``customers``) and ``django_tenants.rls`` itself
 also belong in ``SHARED_APPS``.
 
-**Hybrid deployments are supported.** You may migrate only *some* apps to RLS
-and leave others schema-per-tenant in ``TENANT_APPS``. Each app you isolate
-with RLS must nonetheless be in ``SHARED_APPS`` and must be a deliberate
-choice; see :ref:`shared-apps-vs-tenant-apps`.
+**Hybrid deployments are chosen per database connection, not per app on one
+connection.** The RLS backend pins ``search_path`` to ``public`` for every
+tenant, so a connection using it cannot also serve schema-per-tenant
+``TENANT_APPS`` (their per-tenant-schema tables are no longer on the search
+path). A true hybrid therefore keeps the schema-per-tenant apps on a **separate**
+``DATABASES`` alias using the stock ``django_tenants.postgresql_backend``, routed
+via a database router; every RLS-isolated app goes in ``SHARED_APPS`` on the
+RLS-backend connection. See :ref:`shared-apps-vs-tenant-apps` and the matching
+``Hybrid deployments`` discussion in :ref:`the RLS reference <rls-mechanism>`.
 
-Disable per-tenant schema creation on your ``TenantMixin``
-----------------------------------------------------------
+Disable per-tenant schema creation on your ``TenantMixin`` (RLS-only)
+---------------------------------------------------------------------
 
 ``TenantMixin.auto_create_schema`` defaults to ``True``, which makes
-``TenantMixin.save()`` create a new PostgreSQL schema for each tenant. In RLS
-mode there is only ``public``, so those per-tenant schemas would be empty and
-pointless. Set ``auto_create_schema = False`` (and ``auto_drop_schema =
-False``) on your ``TenantMixin`` subclass so no per-tenant schemas are created
-or dropped going forward:
+``TenantMixin.save()`` create a new PostgreSQL schema for each tenant.
 
-.. code-block:: python
+* **RLS-only deployment** (no schema-per-tenant apps on any connection): there is
+  only ``public``, so per-tenant schemas would be empty and pointless. Set
+  ``auto_create_schema = False`` (and ``auto_drop_schema = False``) on your
+  ``TenantMixin`` subclass so no per-tenant schemas are created or dropped going
+  forward:
 
-    from django_tenants.models import TenantMixin
+  .. code-block:: python
 
-    class Client(TenantMixin):
-        # ... your fields ...
-        auto_create_schema = False   # RLS mode: keep a single public schema
-        auto_drop_schema = False
+      from django_tenants.models import TenantMixin
+
+      class Client(TenantMixin):
+          # ... your fields ...
+          auto_create_schema = False   # RLS-only: keep a single public schema
+          auto_drop_schema = False
+
+* **Hybrid deployment** (some apps remain schema-per-tenant on a separate
+  connection): **keep ``auto_create_schema = True``.** New tenants still need
+  their schema created on the schema-per-tenant connection, or those apps break /
+  route to missing tables. The (otherwise-unused) per-tenant schema on the RLS
+  side is harmless.
 
 This affects only *future* tenant creation. Any per-tenant schemas that already
 exist from your schema-per-tenant deployment are addressed in the data-migration
-steps; this setting just stops new empty ones from appearing.
+steps; for an RLS-only cutover this setting just stops new empty ones appearing.
 
 Middleware: keep ``TenantMainMiddleware``; ``TenantRLSMiddleware`` is optional
 ------------------------------------------------------------------------------
@@ -1314,9 +1341,14 @@ NULL in:
             migrations.AddField(
                 model_name="note",
                 name="tenant",
+                # Mirror TenantRLSModel's tenant FK exactly except for null=True
+                # here (db_index=True, related_name="+"), so makemigrations does
+                # not detect drift and the index exists during the backfill.
                 field=models.ForeignKey(
                     null=True,
+                    db_index=True,
                     on_delete=django.db.models.deletion.CASCADE,
+                    related_name="+",
                     to=settings.TENANT_MODEL,
                 ),
             ),
@@ -1347,8 +1379,11 @@ script, and verify it is complete:
             migrations.AlterField(
                 model_name="note",
                 name="tenant",
+                # Same options as TenantRLSModel's field, now with null=False.
                 field=models.ForeignKey(
+                    db_index=True,
                     on_delete=django.db.models.deletion.CASCADE,
+                    related_name="+",
                     to=settings.TENANT_MODEL,
                 ),
             ),
@@ -2982,6 +3017,15 @@ then apply RLS + a policy whose expression matches ``TenantPolicy``:
             OR (SELECT current_setting('django_tenants.bypass_rls', true)) = 'on')
      WITH CHECK (tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', true), '')::integer)
             OR (SELECT current_setting('django_tenants.bypass_rls', true)) = 'on');
+
+.. note::
+
+   The ``::integer`` cast above assumes an integer tenant primary key (the
+   common ``AutoField`` case). Match it to **your** tenant PK type -- ``::bigint``
+   for a ``BigAutoField``, ``::uuid`` for a ``UUIDField``, ``::text`` for a
+   text key -- exactly as ``TenantPolicy`` does via ``conf.get_tenant_pk_cast()``.
+   The ``tenant_id`` column you add must of course be the same type as the tenant
+   PK.
 
 Populate ``tenant_id`` on token creation (override the creation path or a
 ``BEFORE INSERT`` trigger defaulting to the GUC), or -- cleaner long term -- use a
