@@ -2933,9 +2933,10 @@ situation to one of these:
    ``TENANT_RLS_AUTO_ENABLE = False`` for the upgrade (as recommended in
    :ref:`rls-upgrade-existing`), there is no auto-enable hook to undo.
 
-**You already enabled RLS and something is wrong** (for example, a bad backfill
-left NULL ``tenant_id`` rows invisible -- see :ref:`rls-null-rows`).
-   Restore full visibility immediately by completing the two-part disable:
+**You already enabled RLS and something is wrong.**
+   For example, a bad backfill left NULL ``tenant_id`` rows invisible (see
+   :ref:`rls-null-rows`). Restore full visibility immediately by completing the
+   two-part disable:
 
    .. code-block:: console
 
