@@ -1296,7 +1296,12 @@ an already-existing ``tenant_id`` column. Resolve it one of two ways:
   ``Tenant`` primary key for every row, it is a convenient in-row backfill source
   (see :ref:`the in-row backfill note <rls-backfill-inrow>`) -- but only if it is
   reliably the **pk** and not, say, a schema-name string; verify before trusting
-  it.
+  it. ``makemigrations`` will **interactively** ask *"Was <model>.tenant_id renamed
+  to <model>.legacy_tenant_id? [y/N]"* -- answer ``y`` so it emits a ``RenameField``
+  (followed by the ``AddField`` for the new FK) rather than a drop-and-add that
+  would lose the data. In non-interactive / CI runs ``makemigrations --no-input``
+  will **not** prompt and may guess wrong, so either run it interactively once and
+  commit the file, or hand-author the migration with ``migrations.RenameField``.
 * **Use a different FK attribute name.** Set ``TENANT_RLS_TENANT_FIELD`` to a
   non-colliding name, add a ``ForeignKey`` with that name, and a matching
   ``TenantPolicy(tenant_field=...)`` (as in the custom-field note above).
@@ -3147,10 +3152,14 @@ third-party table you cannot edit (``django.contrib.auth``,
    --     UPDATE authtoken_token SET tenant_id = <resolve owner> WHERE tenant_id IS NULL;
    ALTER TABLE authtoken_token ALTER COLUMN tenant_id SET NOT NULL;
 
-   -- (3) Tenant-scope any global UNIQUE so it is not a covert channel. The token
-   --     PK is `key`; replace the implicit global uniqueness with (tenant_id, key).
+   -- (3) Tenant-scope EVERY global UNIQUE on the table so none is a covert channel
+   --     (Postgres checks UNIQUE with RLS bypassed). authtoken_token has TWO: the
+   --     PK `key`, and `user_id` (Token.user is a OneToOne -> a global UNIQUE).
    ALTER TABLE authtoken_token ADD CONSTRAINT authtoken_token_key_per_tenant
-       UNIQUE (tenant_id, key);   -- and drop the old global UNIQUE on key if present
+       UNIQUE (tenant_id, key);    -- and drop the old global UNIQUE on key if present
+   ALTER TABLE authtoken_token DROP CONSTRAINT authtoken_token_user_id_key;  -- the OneToOne
+   ALTER TABLE authtoken_token ADD CONSTRAINT authtoken_token_user_per_tenant
+       UNIQUE (tenant_id, user_id);
 
    -- (4) Now the policy (byte-identical to TenantPolicy; ::bigint for BigAutoField).
    ALTER TABLE authtoken_token ENABLE ROW LEVEL SECURITY;
@@ -3170,6 +3179,22 @@ third-party table you cannot edit (``django.contrib.auth``,
    ``tenant_id`` column you add (step 1) must be the same type as the tenant PK.
    ``third_party_policy_sql(table, pk_cast=...)`` will emit step (4) for you with
    the right cast, but it does **not** emit steps (1)-(3).
+
+.. warning::
+
+   **Enumerate *every* UNIQUE on a third-party table -- including ``OneToOneField``
+   columns.** A third-party model declares its uniqueness in code you do not own,
+   so ``rls_doctor`` / W005 cannot flag it and you cannot re-express it on the
+   model; you must swap the constraint in raw SQL (step 3). ``authtoken_token`` has
+   **two** global UNIQUEs: ``key`` (the PK) and ``user_id`` (``Token.user`` is a
+   ``OneToOneField``). Leaving ``user_id`` globally unique has two consequences:
+   (a) it is a covert channel (existence of a user's token leaks across tenants,
+   checked with RLS bypassed); and (b) it makes per-tenant tokens *impossible* --
+   one user row can own only one token globally. If you also consolidated
+   ``auth_user`` from per-tenant schemas, its integer ids may now **collide**
+   across tenants (two tenants' "user 5"), so resolve that (see the PK-collision
+   step) before adding ``UNIQUE (tenant_id, user_id)``. The clean long-term
+   alternative is a first-party token model subclassing ``TenantRLSModel`` (below).
 
 Populate ``tenant_id`` on token creation (override the creation path or a
 ``BEFORE INSERT`` trigger defaulting to the GUC), or -- cleaner long term -- use a
