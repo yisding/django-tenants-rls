@@ -1092,6 +1092,16 @@ guide.
 The ``TENANT_MODEL`` app (e.g. ``customers``) and ``django_tenants.rls`` itself
 also belong in ``SHARED_APPS``.
 
+.. note::
+
+   In a full RLS-only cutover every isolated app moves out, so ``TENANT_APPS``
+   ends up empty (``TENANT_APPS = ()``). ``django_tenants`` allows this **only
+   when** ``TENANT_RLS_ENABLED = True`` -- core ``DjangoTenantsConfig.ready()``
+   otherwise raises ``ImproperlyConfigured("TENANT_APPS is empty")``. So set the
+   RLS feature flag (previous sub-step) *before* you empty ``TENANT_APPS``. If you
+   are on an older django-tenants that predates this allowance, keep one harmless
+   entry in ``TENANT_APPS`` (e.g. ``'django.contrib.contenttypes'``).
+
 **Hybrid deployments are chosen per database connection, not per app on one
 connection.** The RLS backend pins ``search_path`` to ``public`` for every
 tenant, so a connection using it cannot also serve schema-per-tenant
@@ -1153,8 +1163,8 @@ enforcer for setups that keep the stock backend instead of switching the
 ``ENGINE``. It is harmless to leave installed; if you do, place it *after*
 ``TenantMainMiddleware``.
 
-Run ``manage.py check`` and clear W001 before proceeding
---------------------------------------------------------
+Run ``manage.py check --deploy`` and clear W001 before proceeding
+-----------------------------------------------------------------
 
 Once the settings above are in place, confirm that an *enforcer* is configured.
 The :ref:`W001 check <rls-system-checks>` fires when ``TENANT_RLS_ENABLED`` is
@@ -1163,9 +1173,17 @@ configured -- meaning policies would be created on tables but the tenant
 session variable would never be set, so every query would evaluate against an
 unset variable and silently return nothing.
 
+.. danger::
+
+   **You must pass** ``--deploy``\ **.** ``W001`` and ``W003`` are registered as
+   *deployment* checks, so a plain ``manage.py check`` (without ``--deploy``)
+   **never runs them** -- it will report "no issues" even when the RLS backend is
+   not wired at all, giving you false confidence that isolation is on when it is
+   not. Always verify with:
+
 .. code-block:: console
 
-    $ python manage.py check
+    $ python manage.py check --deploy --database default
 
 A clean run (no ``W001``) confirms the backend is wired correctly. If W001
 still appears, you either did not switch ``DATABASES[alias]['ENGINE']`` to
@@ -1175,10 +1193,17 @@ data-migration steps.
 
 .. note::
 
-   ``manage.py check`` may also surface the W003 role check (an **error** that
-   blocks startup) if your configured DB role can bypass RLS. That belongs to
-   database preparation rather than the settings cutover; see
+   The same ``--deploy`` run also surfaces the W003 role check (an **error** that
+   blocks startup) if your configured DB role can bypass RLS -- it, too, is a
+   deployment check and is invisible to a plain ``manage.py check``. W003 belongs
+   to database preparation rather than the settings cutover; see
    :ref:`rls-database-role` and :ref:`rls-system-checks`.
+
+.. tip::
+
+   The most reliable gate is ``manage.py rls_doctor``: it re-runs W001/W003/E001
+   regardless of ``--deploy`` (so it cannot be masked by the deploy-check split)
+   *and* reports per-model readiness. Prefer it as your verification command.
 
 
 .. _rls-migration-step-2:
@@ -1233,6 +1258,38 @@ lazily and named ``"<db_table>_tenant_isolation"``.
    must define your own ``ForeignKey`` with that name **and** declare a matching
    ``TenantPolicy(tenant_field=...)`` in ``Meta.rls_policies`` so the generated
    policy SQL references the column that actually exists.
+
+.. _rls-migration-existing-tenant-col:
+
+Your model already has a ``tenant`` / ``tenant_id`` column
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Some schema-per-tenant apps **denormalize** the owning tenant into a plain column
+(e.g. ``tenant_id = models.IntegerField(...)``) so background/async code that has
+lost the schema context can still recover it. The base ``tenant`` FK maps to the
+column ``tenant_id`` (Django derives ``<field>_id``), so subclassing
+``TenantRLSModel`` on such a model is a **column-name collision**, not merely a
+type mismatch -- Django raises ``models.E006`` at check/``makemigrations`` time::
+
+    yourapp.YourModel.tenant_id: (models.E006) The field 'tenant_id' clashes with
+    the field 'tenant' from model 'yourapp.yourmodel'.
+
+This blocks the migration before any SQL runs. ``rls_doctor`` is no help here: it
+keys on a field literally named ``tenant`` (``conf.tenant_field()``), so a model
+whose only tenant column is a bare ``tenant_id`` is reported as *missing the FK*
+(``generate_migration`` with a staged ``AddField``), which would then try to add
+an already-existing ``tenant_id`` column. Resolve it one of two ways:
+
+* **Rename/drop the legacy column first.** Rename the existing ``tenant_id`` out
+  of the way (or drop it once nothing reads it), *then* add the real ``tenant`` FK
+  and backfill it (Step 3). If the legacy integer already holds the numeric
+  ``Tenant`` primary key for every row, it is a convenient in-row backfill source
+  (see :ref:`the in-row backfill note <rls-backfill-inrow>`) -- but only if it is
+  reliably the **pk** and not, say, a schema-name string; verify before trusting
+  it.
+* **Use a different FK attribute name.** Set ``TENANT_RLS_TENANT_FIELD`` to a
+  non-colliding name, add a ``ForeignKey`` with that name, and a matching
+  ``TenantPolicy(tenant_field=...)`` (as in the custom-field note above).
 
 .. _rls-migration-w002:
 
@@ -1613,6 +1670,41 @@ Adjust ``BATCH`` to your row size and lock tolerance; tune the cursor-advance
 query to match your table's key. The exact mechanics are project-specific --
 the point is bounded, ordered, resumable chunks.
 
+.. _rls-backfill-inrow:
+
+In-row / denormalized tenant source (no cross-schema copy)
+----------------------------------------------------------
+
+The recipe above copies rows *across schemas*. If a table is **already in the
+shared schema** and merely needs its new ``tenant_id`` populated -- the common
+case when a model denormalized the owning tenant into a legacy column (see
+:ref:`your model already has a tenant_id column
+<rls-migration-existing-tenant-col>`) -- there is
+no cross-schema loop at all. The backfill is a same-table ``UPDATE`` from the
+legacy column:
+
+.. code-block:: python
+
+    with bypass_rls(), connection.cursor() as cur:
+        # ONLY valid if the legacy column holds the numeric Tenant pk for every
+        # row. If it holds a schema-name STRING instead, join to the tenant
+        # registry: SET tenant_id = (SELECT id FROM customers_tenant t
+        #   WHERE t.schema_name = myapp_event.legacy_schema_name)
+        cur.execute(
+            "UPDATE myapp_event "
+            "SET tenant_id = legacy_tenant_id "
+            "WHERE tenant_id IS NULL AND legacy_tenant_id IS NOT NULL"
+        )
+
+.. warning::
+
+   **The zero-NULL gate still applies.** A denormalized column is often
+   incomplete -- e.g. a "warn and skip when no tenant is set" emit path leaves
+   some rows with a NULL legacy value. Those rows will still be NULL after the
+   ``UPDATE`` and will fail the verification below (correctly). Handle them
+   explicitly (a cross-schema fallback, or delete/repair) before tightening to
+   ``null=False``. Never assume the legacy column is complete.
+
 Verification -- the hard gate before tightening the schema
 -----------------------------------------------------------
 
@@ -1634,8 +1726,11 @@ to **skip** (with a loud warning) any table that still has unscoped rows;
 ``manage.py enable_rls`` warns but proceeds. Do not rely on those warnings as
 your gate -- make the assertion fail your migration instead.
 
-You may also cross-check the copied counts against the sources, which catches
-silently-dropped rows that a NULL check would miss:
+You **must also** cross-check the copied counts against the sources -- this is
+**not optional whenever you batched the backfill**. A batch that breaks
+mid-tenant leaves the zero-NULL check passing (every *copied* row has a non-NULL
+``tenant_id``; the un-copied rows are simply absent, not NULL), so only the
+per-tenant source-vs-destination count catches the silently-dropped rows:
 
 .. code-block:: python
 
@@ -2083,20 +2178,34 @@ Cross-tenant and request-less code: ``tenant_context`` / ``schema_context``
 ---------------------------------------------------------------------------
 
 The existing ``django_tenants.utils.tenant_context`` and ``schema_context``
-context managers continue to work and remain the right tool for activating a
-tenant outside a request. Internally they call ``connection.set_tenant()``,
-which the RLS backend turns into the per-connection tenant GUC (and pins the
-schema to ``public``, since RLS mode keeps all data in one schema):
+context managers still activate a tenant outside a request. Internally they call
+``connection.set_tenant()``, which the RLS backend turns into the per-connection
+tenant GUC (and pins the schema to ``public``, since RLS mode keeps all data in
+one schema):
 
 .. code-block:: python
 
     from django_tenants.utils import tenant_context, schema_context
 
-    with tenant_context(tenant):     # activates `tenant` for the block
+    with tenant_context(tenant):     # activates `tenant` (a Tenant INSTANCE)
         Note.objects.all()           # sees only `tenant`'s rows
 
-    with schema_context(tenant.schema_name):
-        Note.objects.all()
+.. danger::
+
+   **Under RLS, ``schema_context(<schema_name string>)`` silently returns zero
+   rows.** ``schema_context`` is given only a *name*, so it activates a synthetic
+   ``FakeTenant`` that has **no primary key** -- and the RLS GUC is the tenant
+   **pk**. A pk-less tenant sets the GUC to the empty sentinel, so the policy
+   matches *nothing*: reads return nothing and writes fail the ``WITH CHECK``.
+   This is fail-closed (no data leak) but it is a silent correctness bug, and it
+   is exactly the pattern schema-per-tenant background code tends to use
+   (``with schema_context(snapshot_schema_name):``).
+
+   Only ``tenant_context(<Tenant instance>)`` and ``rls_context(<instance or
+   pk>)`` activate a *real* tenant under RLS. If your code is holding a
+   ``schema_name`` string, resolve it to a ``Tenant`` (or its pk) first:
+   ``tenant = Tenant.objects.get(schema_name=name)`` then
+   ``with rls_context(tenant): ...``.
 
 On exit, both managers **restore the previously active tenant** (or revert to
 the public/no-tenant state if none was active) -- and they restore it from the
@@ -2903,10 +3012,18 @@ The three failure classes
    tenant, so all tenants share one namespace. These live *outside* Postgres, so
    RLS gives **zero** protection and no check fires.
 #. **Out-of-request code starts with no tenant (loud, fail-closed).** Celery
-   tasks, Channels consumers, management commands, and signal handlers run
+   tasks, Channels consumers, management commands, signal handlers, **and
+   in-process background work -- ``ThreadPoolExecutor``, ``loop.run_in_executor``,
+   ``asyncio.to_thread``, raw threads, and shielded/detached coroutines** -- run
    without ``TenantMainMiddleware``, so the tenant GUC is at its empty sentinel:
    policied reads return **zero rows** and policied writes are rejected by
    ``WITH CHECK`` until the code sets the tenant with ``with rls_context(tenant):``.
+   Connections are **thread-local**, so a pooled worker thread gets a *fresh*
+   connection at the empty sentinel -- capture the tenant pk on the submitting
+   thread, pass it into the worker, and open ``with rls_context(tenant_pk):`` at
+   the **start** of the worker. This is the direct replacement for code that
+   previously snapshotted ``schema_name`` and re-entered ``schema_context()`` in a
+   thread (which, as the warning above explains, now degrades to zero rows).
 
 The one rule
 ------------
@@ -2994,28 +3111,54 @@ Token authentication (DRF ``authtoken``)
 ``rest_framework.authtoken.Token`` cannot inherit ``TenantRLSModel``, so under
 RLS there is one shared ``public.authtoken_token`` with no policy and
 ``TokenAuthentication`` looks tokens up by key alone -- **a token minted for
-tenant A authenticates as tenant B**. Policy the table yourself (your migration,
-not the library): add a nullable ``tenant_id``, backfill it, ``SET NOT NULL``,
-then apply RLS + a policy whose expression matches ``TenantPolicy``:
+tenant A authenticates as tenant B**. The same applies to every tenant-resident
+third-party table you cannot edit (``django.contrib.auth``,
+``django.contrib.sessions``, vendored auth packages, …).
+
+.. important::
+
+   **The tool only emits the policy, not the column.** ``rls_doctor`` and
+   ``--generate`` ignore non-``TenantRLSModel`` tables, and
+   ``django_tenants.rls.scaffold.third_party_policy_sql`` **assumes the table
+   already has a ``<tenant_field>_id`` column.** None of authtoken / auth /
+   sessions do. You must run the **full ordered sequence yourself** -- add the
+   column, backfill it, tighten it, scope its UNIQUEs, *then* apply the policy:
 
 .. code-block:: sql
 
+   -- (1) Add the tenant column NULLABLE (match the type to your tenant PK:
+   --     bigint for BigAutoField, integer for AutoField, uuid/text as needed).
+   ALTER TABLE authtoken_token ADD COLUMN tenant_id bigint NULL
+       REFERENCES customers_tenant(id) ON DELETE CASCADE;
+
+   -- (2) Backfill every row under bypass_rls() (no policy exists yet, but make
+   --     it a habit), then make it NOT NULL once zero rows are NULL.
+   --     UPDATE authtoken_token SET tenant_id = <resolve owner> WHERE tenant_id IS NULL;
+   ALTER TABLE authtoken_token ALTER COLUMN tenant_id SET NOT NULL;
+
+   -- (3) Tenant-scope any global UNIQUE so it is not a covert channel. The token
+   --     PK is `key`; replace the implicit global uniqueness with (tenant_id, key).
+   ALTER TABLE authtoken_token ADD CONSTRAINT authtoken_token_key_per_tenant
+       UNIQUE (tenant_id, key);   -- and drop the old global UNIQUE on key if present
+
+   -- (4) Now the policy (byte-identical to TenantPolicy; ::bigint for BigAutoField).
    ALTER TABLE authtoken_token ENABLE ROW LEVEL SECURITY;
    ALTER TABLE authtoken_token FORCE ROW LEVEL SECURITY;
    CREATE POLICY authtoken_token_tenant_isolation ON authtoken_token
-     USING (tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', true), '')::integer)
+     USING (tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', true), '')::bigint)
             OR (SELECT current_setting('django_tenants.bypass_rls', true)) = 'on')
-     WITH CHECK (tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', true), '')::integer)
+     WITH CHECK (tenant_id = (SELECT NULLIF(current_setting('django_tenants.tenant_id', true), '')::bigint)
             OR (SELECT current_setting('django_tenants.bypass_rls', true)) = 'on');
 
 .. note::
 
-   The ``::integer`` cast above assumes an integer tenant primary key (the
-   common ``AutoField`` case). Match it to **your** tenant PK type -- ``::bigint``
-   for a ``BigAutoField``, ``::uuid`` for a ``UUIDField``, ``::text`` for a
-   text key -- exactly as ``TenantPolicy`` does via ``conf.get_tenant_pk_cast()``.
-   The ``tenant_id`` column you add must of course be the same type as the tenant
-   PK.
+   The ``::bigint`` cast above matches a ``BigAutoField`` tenant PK (Django's
+   default since 3.2). Match it to **your** tenant PK type -- ``::integer`` for an
+   ``AutoField``, ``::uuid`` for a ``UUIDField``, ``::text`` for a text key --
+   exactly as ``TenantPolicy`` does via ``conf.get_tenant_pk_cast()``. The
+   ``tenant_id`` column you add (step 1) must be the same type as the tenant PK.
+   ``third_party_policy_sql(table, pk_cast=...)`` will emit step (4) for you with
+   the right cast, but it does **not** emit steps (1)-(3).
 
 Populate ``tenant_id`` on token creation (override the creation path or a
 ``BEFORE INSERT`` trigger defaulting to the GUC), or -- cleaner long term -- use a
@@ -3066,6 +3209,17 @@ from the real tenant), then **flush / namespace-bump Redis** so stale
 ``public:``-prefixed entries written during the broken window are not served.
 Ensure out-of-request code sets the tenant before any cache access, or the key
 falls back to the public prefix.
+
+.. note::
+
+   **If you never set ``KEY_FUNCTION`` at all**, your cache was already a single
+   shared keyspace across tenants -- a pre-existing condition that RLS neither
+   causes nor fixes (Postgres RLS does not reach Redis). ``rls_doctor`` reports
+   the cache as ``ok`` in this case because there is no schema-name
+   ``KEY_FUNCTION`` to flag, which is *literally* true but easy to misread as "the
+   cache is tenant-safe." It is not: adopting RLS is the moment to add
+   ``KEY_FUNCTION = "django_tenants.rls.cache.make_key"`` (and the matching
+   ``REVERSE_KEY_FUNCTION``) so cached values are actually per-tenant.
 
 File / media storage (e.g. django-storages S3)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3133,11 +3287,14 @@ Every item above depends on *your* settings and code. Concretely:
    #   SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname IN (...);
    #   SELECT * FROM pg_policies WHERE tablename IN (...);   -- empty policy set on a per-tenant table = the bug
 
-   # Out-of-request execution (failure class 3):
+   # Out-of-request execution (failure class 3) -- incl. in-process threads:
    grep -rn "call_command\|database_sync_to_async\|@shared_task\|@app.task\|post_save\|pre_save" <app>
+   grep -rnE "ThreadPoolExecutor|run_in_executor|asyncio.to_thread|\.submit\(|threading.Thread" <app>
+   grep -rn "schema_context\|optional_schema_context" <app>   # string-based -> degrades to zero rows under RLS
 
-   # Confirm the runtime role cannot bypass RLS:
-   python manage.py check --database default                  # W003 must NOT fire
+   # Confirm the runtime role cannot bypass RLS (W001/W003 are DEPLOY checks):
+   python manage.py check --deploy --database default         # W001/W003 must NOT fire
+   python manage.py rls_doctor                                # authoritative gate (not masked by --deploy)
 
 After fixing, run ``manage.py verify_rls`` in CI (it fails non-zero if any
 ``TenantRLSModel`` table is missing RLS/FORCE/a policy), and re-run a two-tenant
@@ -3236,6 +3393,22 @@ Audit the per-schema indexes you relied on before the cutover and re-express
 each one as a tenant-leading composite. Unique constraints in particular almost
 always need ``tenant_id`` added as the leading column, since a value that was
 unique within a schema is no longer unique within the shared table.
+
+.. warning::
+
+   **Uniqueness enforced in Python is invisible to the tooling.** The ``W005``
+   check and ``rls_doctor`` only see uniqueness *declared on the model*
+   (``unique=True``, ``Meta.unique_together``, ``Meta.constraints``). A rule
+   enforced in ``Model.clean()`` / ``validate_unique()`` / ``save()`` via a
+   ``.filter(...).exists()`` lookup is **not** flagged -- and under RLS that
+   lookup now runs *with* the tenant predicate, so it silently becomes
+   tenant-scoped: it can no longer see another tenant's colliding row, so a
+   previously-global guarantee quietly narrows (and the cross-tenant existence it
+   used to detect is now invisible). Grep your models for ``.exists()`` /
+   ``.filter(`` inside ``save``/``clean`` and either add a real
+   ``UniqueConstraint(fields=["tenant", ...])`` (so the DB enforces it and W005
+   can see it) or run the lookup under ``bypass_rls()`` if a global check is
+   genuinely intended.
 
 .. _rls-migration-poolers:
 
