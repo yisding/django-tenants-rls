@@ -59,6 +59,10 @@ CLASSIFICATIONS = (
 _SCHEMA_BASED_CACHE_KEY_FUNCTION = "django_tenants.cache.make_key"
 _RLS_CACHE_KEY_FUNCTION = "django_tenants.rls.cache.make_key"
 _SCHEMA_BASED_STORAGE = "django_tenants.files.storage.TenantFileSystemStorage"
+# The deprecated wrapper re-exported from files/storages.py (note the plural)
+# has the same schema-name-based behaviour, so it is an offender too.
+_LEGACY_SCHEMA_BASED_STORAGE = "django_tenants.files.storages.TenantFileSystemStorage"
+_SCHEMA_BASED_STORAGES = (_SCHEMA_BASED_STORAGE, _LEGACY_SCHEMA_BASED_STORAGE)
 _RLS_STORAGE = "django_tenants.rls.storage.RLSTenantFileSystemStorage"
 
 
@@ -71,7 +75,15 @@ def _role_bypasses_rls(connection):
     bypasses RLS we must not falsely declare every model ``blocked``. This mirrors
     the best-effort posture of :func:`checks.check_rls_role`, but operates on the
     caller-owned connection (so ``scan(database=...)`` can target any alias).
+
+    Honors ``TENANT_RLS_ALLOW_BYPASS_ROLE``: when the operator has explicitly
+    opted into a bypassing role (isolation guaranteed by another mechanism),
+    :func:`checks.check_rls_role` suppresses W003, so we must not declare the scan
+    ``blocked`` either -- otherwise the documented opt-out would make ``scan()``
+    mark every model blocked and ``--fix`` refuse.
     """
+    if conf.allow_bypass_role():
+        return False
     try:
         if connection.vendor != "postgresql":
             return False
@@ -114,6 +126,33 @@ def _has_tenant_field(model):
     try:
         model._meta.get_field(conf.tenant_field())
         return True
+    except Exception:
+        return False
+
+
+def _has_unscoped_rows(model, connection):
+    """Whether ``model``'s table has rows with a NULL tenant FK, on ``connection``.
+
+    :meth:`TenantRLSModel.has_unscoped_rows` always queries the default tenant
+    alias; the doctor must check the alias actually being scanned
+    (``scan(database=...)`` / the admin ``?database=`` knob) or it could miss NULL
+    rows on a non-default database and wrongly report an unsafe table as
+    ``auto_fixable``. So it runs the same cheap ``EXISTS`` on the caller-owned
+    connection. Best-effort: a missing / unreadable table returns False (by the
+    time this runs, ``rls_live_problems`` has already queried the same connection,
+    so the table is readable).
+    """
+    field = conf.tenant_field()
+    attname = "%s_id" % field
+    table = model._meta.db_table
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT EXISTS(SELECT 1 FROM %s WHERE %s IS NULL)"
+                % (connection.ops.quote_name(table), connection.ops.quote_name(attname))
+            )
+            row = cursor.fetchone()
+        return bool(row and row[0])
     except Exception:
         return False
 
@@ -197,16 +236,9 @@ def classify_model(model, connection, *, force):
     # No nullable column and no UNIQUE leak: the remaining live_problems are some
     # combination of RLS-not-enabled / not-forced / no-policy. Whether this is
     # safely auto-fixable hinges on unscoped (NULL) rows.
-    try:
-        unscoped = model.has_unscoped_rows()
-    except Exception:
-        # has_unscoped_rows is itself defensive and returns False on a missing
-        # table, so a raise here is unexpected; be conservative and require a
-        # human rather than auto-enabling against an unknown state.
-        return "manual", list(live_problems) + [
-            "could not determine whether the table has unscoped (NULL tenant) "
-            "rows; backfill and verify before enabling RLS (Step 4)"
-        ]
+    # Check unscoped rows on the SCANNED connection (not always the default
+    # tenant alias) so scan(database=...) classifies the requested database.
+    unscoped = _has_unscoped_rows(model, connection)
 
     if unscoped:
         # (4) Unscoped rows owe an app-specific backfill (Step 4) -- never auto-run.
@@ -325,7 +357,7 @@ def _storage_finding():
     if backend is None:
         backend = getattr(settings, "DEFAULT_FILE_STORAGE", None)
 
-    if backend == _SCHEMA_BASED_STORAGE:
+    if backend in _SCHEMA_BASED_STORAGES:
         return {
             "id": "django_tenants_rls.storage",
             "level": "warning",
@@ -334,7 +366,7 @@ def _storage_finding():
                 "The default file storage is %r, which derives the per-tenant "
                 "media path from connection.schema_name. Under RLS that is pinned "
                 "to 'public' for every tenant, so all tenants' files share one "
-                "directory (a cross-tenant file leak)." % _SCHEMA_BASED_STORAGE
+                "directory (a cross-tenant file leak)." % backend
             ),
             "remedy": (
                 "Point STORAGES['default']['BACKEND'] (or DEFAULT_FILE_STORAGE) at "
@@ -348,8 +380,9 @@ def _storage_finding():
         "level": "ok",
         "title": "Default file storage",
         "detail": (
-            "The default file storage is not the schema-name-based "
-            "%r." % _SCHEMA_BASED_STORAGE
+            "The default file storage is not a schema-name-based "
+            "TenantFileSystemStorage (neither %r nor the deprecated %r)."
+            % (_SCHEMA_BASED_STORAGE, _LEGACY_SCHEMA_BASED_STORAGE)
         ),
         "remedy": "",
         "step": 1,
@@ -375,9 +408,63 @@ def _callable_dotted_path(value):
     return None
 
 
-def _settings_findings():
+def _role_finding(connection):
+    """W003 settings finding computed on the SCANNED ``connection``.
+
+    :func:`checks.check_rls_role` always opens the default tenant alias; the
+    doctor must report the role for the alias actually being scanned so the
+    finding stays consistent with the per-model classifications and the top-level
+    ``blocked`` flag (which both use the scanned connection). Honors
+    ``TENANT_RLS_ALLOW_BYPASS_ROLE`` (ok when opted out) and degrades to ok when
+    the role cannot be determined (non-PostgreSQL / unreachable).
+    """
+    ok = {
+        "id": "ok", "level": "ok", "title": "Database role (W003)",
+        "detail": (
+            "The connecting role does not bypass RLS (not a superuser and no "
+            "BYPASSRLS attribute), so policies are actually enforced."
+        ),
+        "remedy": "", "step": 1,
+    }
+    if conf.allow_bypass_role():
+        return ok
+    try:
+        if connection.vendor != "postgresql":
+            return ok
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT rolname, rolsuper, rolbypassrls "
+                "FROM pg_roles WHERE rolname = current_user"
+            )
+            row = cursor.fetchone()
+    except Exception:
+        return ok
+    if not row:
+        return ok
+    rolname, is_super, is_bypass = row
+    if not (is_super or is_bypass):
+        return ok
+    reason = "is a superuser" if is_super else "has the BYPASSRLS attribute"
+    return {
+        "id": checks.W003_ID, "level": "error", "title": "Database role (W003)",
+        "detail": (
+            "The database role %r %s, so PostgreSQL bypasses ALL row-security "
+            "policies on this connection: tenant isolation is NOT enforced (even "
+            "with FORCE ROW LEVEL SECURITY)." % (rolname, reason)
+        ),
+        "remedy": (
+            "Connect django-tenants as a NOSUPERUSER NOBYPASSRLS role. The "
+            "documented opt-out TENANT_RLS_ALLOW_BYPASS_ROLE=True suppresses this."
+        ),
+        "step": 1,
+    }
+
+
+def _settings_findings(connection):
     """Assemble the ``settings`` section by composing the check predicates + the
-    two new introspections. Each entry follows the shared contract shape.
+    two new introspections. Each entry follows the shared contract shape. The
+    role (W003) finding is computed on the caller-supplied ``connection`` so it
+    matches the alias being scanned.
     """
     findings = [
         _setting_entry(
@@ -389,15 +476,7 @@ def _settings_findings():
             ),
             step=1,
         ),
-        _setting_entry(
-            checks.check_rls_role(None),
-            ok_title="Database role (W003)",
-            ok_detail=(
-                "The connecting role does not bypass RLS (not a superuser and no "
-                "BYPASSRLS attribute), so policies are actually enforced."
-            ),
-            step=1,
-        ),
+        _role_finding(connection),
         _setting_entry(
             checks.check_rls_var_names(None),
             ok_title="Session/bypass GUC variable names (E001)",
@@ -447,7 +526,7 @@ def scan(database=None):
     connection = connections[alias]
     force = conf.force_rls()
 
-    settings_findings = _settings_findings()
+    settings_findings = _settings_findings(connection)
 
     # Top-level blocked flag: the connecting role bypasses RLS (W003). This is the
     # same predicate classify_model uses per model, computed once for the summary

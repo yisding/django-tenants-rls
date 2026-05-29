@@ -381,18 +381,36 @@ class Command(BaseCommand):
 
             written = []
             if model is not None:
-                # Step 3/5: staged FK add (null=True) + commented backfill stub +
-                # delimited NOT NULL AlterField.
-                written.append(self._write_scaffold(
-                    out_dir, "%s_staged_fk.py" % slug,
-                    scaffold.staged_fk_migration(model),
-                ))
-                # Step 6: enable RLS + policy migration (so the operator has the
-                # follow-up ready once the column is backfilled + NOT NULL).
+                from django_tenants.rls import doctor as _doctor
+
+                # Choose scaffolds by the ACTUAL problem -- generate_migration also
+                # covers models that already HAVE the tenant FK (nullable column,
+                # or only a tenant-omitting UNIQUE), where a staged AddField would
+                # fail with a duplicate column.
+                problems = item.get("problems") or []
+                missing_fk = not _doctor._has_tenant_field(model)
+                nullable = any("NULLABLE" in p for p in problems)
+
+                if missing_fk:
+                    # Step 3-5: add the FK (null=True) + backfill stub + NOT NULL.
+                    written.append(self._write_scaffold(
+                        out_dir, "%s_staged_fk.py" % slug,
+                        scaffold.staged_fk_migration(model),
+                    ))
+                elif nullable:
+                    # FK exists but is nullable: tighten it -- NO AddField (that
+                    # would be a duplicate-column error). Steps 4-5.
+                    written.append(self._write_scaffold(
+                        out_dir, "%s_notnull.py" % slug,
+                        scaffold.notnull_migration(model),
+                    ))
+
+                # Step 6: enable RLS + policy follow-up (idempotent if already on).
                 written.append(self._write_scaffold(
                     out_dir, "%s_enable_rls.py" % slug,
                     scaffold.enable_rls_migration(model),
                 ))
+
                 # Step 8: tenant-scoped UNIQUE rewrites for any constraint that
                 # omits the tenant. One scaffold per offending field set.
                 for idx, fields in enumerate(self._unique_fields_omitting_tenant(model)):
@@ -466,15 +484,26 @@ class Command(BaseCommand):
 
         scan = doctor.scan(database=alias)
 
-        if do_fix:
-            # _do_fix refuses (SystemExit 1) on blocked / unscoped rows, applies
-            # the safe slice, and returns the post-fix re-scan.
-            scan = self._do_fix(scan)
+        # In --format json, stdout must contain ONLY the JSON document. --fix /
+        # --generate write progress to self.stdout, so temporarily route that to
+        # stderr while they run; the JSON dump below then has stdout to itself.
+        json_mode = fmt == "json"
+        saved_stdout = self.stdout
+        if json_mode:
+            self.stdout = self.stderr
+        try:
+            if do_fix:
+                # _do_fix refuses (SystemExit 1) on blocked / unscoped rows,
+                # applies the safe slice, and returns the post-fix re-scan.
+                scan = self._do_fix(scan)
 
-        if generate_dir is not None:
-            self._do_generate(scan, generate_dir)
+            if generate_dir is not None:
+                self._do_generate(scan, generate_dir)
+        finally:
+            if json_mode:
+                self.stdout = saved_stdout
 
-        if fmt == "json":
+        if json_mode:
             # Dump the (possibly post-fix) scan verbatim for tooling. default=str
             # keeps any non-JSON-native value (e.g. a stray Decimal) serializable.
             self.stdout.write(json.dumps(scan, indent=2, default=str))

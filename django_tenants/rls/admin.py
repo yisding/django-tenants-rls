@@ -30,28 +30,40 @@ from django.utils.translation import gettext_lazy as _
 from django.views.decorators.cache import never_cache
 
 
-# Permission an admin user must hold (in addition to ``is_staff``) to view the
-# readiness dashboard. ``view_tenant`` is the standard auto-generated view
-# permission on the tenant model's app; requiring a model-level permission keeps
-# the page off-limits to staff who cannot otherwise inspect tenants. Projects
-# that want a different gate can wrap their own view around ``doctor.scan``.
-RLS_READINESS_PERMISSION = "django_tenants.view_tenant"
-
 # Template rendered by the view. Shipped as package data (see pyproject.toml).
 RLS_READINESS_TEMPLATE = "django_tenants_rls/rls_readiness.html"
+
+
+def rls_readiness_permission():
+    """Permission a staff user must hold to view the dashboard, derived from the
+    configured tenant model.
+
+    The tenant model is ``settings.TENANT_MODEL`` (e.g. ``customers.Client``), so
+    its standard view permission is ``<app_label>.view_<model_name>``
+    (e.g. ``customers.view_client``) -- **not** ``django_tenants.view_tenant``
+    (the tenant model rarely lives in the ``django_tenants`` app). Deriving it
+    from the model means staff who legitimately hold the tenant view permission
+    (and superusers) can see the page, instead of being denied by a hard-coded
+    permission that does not exist in the project.
+    """
+    from django_tenants.utils import get_tenant_model
+
+    meta = get_tenant_model()._meta
+    return "%s.view_%s" % (meta.app_label, meta.model_name)
 
 
 def _user_may_view(request):
     """Return True if ``request.user`` may see the readiness dashboard.
 
-    Gate: active staff member who additionally holds
-    :data:`RLS_READINESS_PERMISSION`. Superusers pass the permission check
-    implicitly (``User.has_perm`` returns True for active superusers).
+    Gate: active staff member who additionally holds the tenant model's view
+    permission (see :func:`rls_readiness_permission`). Superusers pass the
+    permission check implicitly (``User.has_perm`` returns True for active
+    superusers).
     """
     user = getattr(request, "user", None)
     if user is None or not user.is_active or not user.is_staff:
         return False
-    return user.has_perm(RLS_READINESS_PERMISSION)
+    return user.has_perm(rls_readiness_permission())
 
 
 def rls_readiness_view(request, admin_site=None):

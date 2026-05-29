@@ -285,5 +285,54 @@ class UniqueConstraintMigrationTestCase(_ScaffoldBase):
         self.assertIn("tenant", text)
 
 
+class ReviewFixScaffoldTestCase(_ScaffoldBase):
+    """Regression tests for the PR review fixes to the scaffold generators."""
+
+    def test_quote_ident_doubles_embedded_quote(self):
+        # Postgres identifier escaping: an embedded double quote is doubled so the
+        # identifier cannot break out of the surrounding quotes.
+        self.assertEqual(scaffold._quote_ident('we"ird'), '"we""ird"')
+        self.assertEqual(scaffold._quote_ident("plain"), '"plain"')
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_third_party_policy_sql_quotes_table_identifier(self):
+        # The raw third-party DDL must wrap the table identifier in double quotes
+        # so a reserved word / mixed-case name (here the SQL keyword ``order``) is
+        # emitted safely rather than as a bare identifier.
+        sql = scaffold.third_party_policy_sql("order", pk_cast="integer")
+        self.assertIn('ALTER TABLE "order" ENABLE ROW LEVEL SECURITY', sql)
+        self.assertIn('CREATE POLICY', sql)
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_notnull_migration_has_no_addfield(self):
+        # For a model that already HAS the (nullable) FK, the scaffold must NOT
+        # emit AddField (a duplicate-column error) -- only the NOT NULL AlterField.
+        text = scaffold.notnull_migration(self.simple)
+        self.assertNotIn("AddField", text)
+        self.assertIn("AlterField", text)
+        self.assertIn("null=False", text)
+        compile(text, "<notnull>", "exec")  # valid Python module
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_field_level_unique_removal_uses_alterfield(self):
+        # ``email`` is a field-level unique=True -> the removal *operation* must be
+        # migrations.AlterField, NOT migrations.RemoveConstraint (which cannot
+        # remove a field-level unique=True). The op names all appear in the
+        # explanatory comment, so assert on the actual ``migrations.X(`` call.
+        text = scaffold.unique_constraint_migration(self.global_unique, ["email"])
+        self.assertIn("migrations.AlterField(", text)
+        self.assertNotIn("migrations.RemoveConstraint(", text)
+        compile(text, "<unique>", "exec")  # valid Python module
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_unique_together_removal_uses_alteruniquetogether(self):
+        # ``slug`` comes from unique_together -> the removal *operation* must be
+        # migrations.AlterUniqueTogether, NOT migrations.RemoveConstraint.
+        text = scaffold.unique_constraint_migration(self.global_unique, ["slug"])
+        self.assertIn("migrations.AlterUniqueTogether(", text)
+        self.assertNotIn("migrations.RemoveConstraint(", text)
+        compile(text, "<unique>", "exec")  # valid Python module
+
+
 if __name__ == "__main__":
     unittest.main()

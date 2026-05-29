@@ -193,9 +193,16 @@ class ClassifyModelTestCase(unittest.TestCase):
     def _classify(self, model, *, live_problems, force=True, connection=None):
         # rls_live_problems is the live-introspection primitive the doctor
         # composes; patch it wherever the doctor references it (mirrors
-        # test_checks patching checks.rls_live_problems).
+        # test_checks patching checks.rls_live_problems). The doctor now checks
+        # unscoped rows on the SCANNED connection via doctor._has_unscoped_rows
+        # (not model.has_unscoped_rows, which ignores the alias), so drive that
+        # from the fake model's configured flag.
         conn = connection if connection is not None else _FakeConnection()
-        with _patch_doctor_attr("rls_live_problems", return_value=list(live_problems)):
+        with _patch_doctor_attr("rls_live_problems", return_value=list(live_problems)), \
+                mock.patch.object(
+                    doctor, "_has_unscoped_rows",
+                    return_value=getattr(model, "_unscoped_rows", False),
+                ):
             return doctor.classify_model(model, conn, force=force)
 
     @override_settings(TENANT_RLS_ENABLED=True)
@@ -629,6 +636,44 @@ class ScanSettingsFindingsTestCase(unittest.TestCase):
         ):
             result = doctor.scan()
         self.assertTrue(result["rls_enabled"])
+
+
+class ReviewFixDoctorTestCase(unittest.TestCase):
+    """Regression tests for the PR review fixes to the doctor."""
+
+    @override_settings(TENANT_RLS_ENABLED=True, TENANT_RLS_ALLOW_BYPASS_ROLE=True)
+    def test_role_bypass_honors_opt_out(self):
+        # With the documented opt-out set, a bypassing (superuser) role must NOT
+        # be reported as bypassing -- otherwise scan() marks every model blocked
+        # and --fix refuses even though the operator disabled the safety net.
+        conn = _FakeConnection(row=(True, False))  # rolsuper=True
+        self.assertFalse(doctor._role_bypasses_rls(conn))
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_role_bypass_detected_without_opt_out(self):
+        conn = _FakeConnection(row=(True, False))
+        self.assertTrue(doctor._role_bypasses_rls(conn))
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_role_finding_uses_scanned_connection(self):
+        # The W003 settings finding is computed on the passed connection, not the
+        # default alias, so scan(database=...) reports a consistent role status.
+        bypassing = _FakeConnection(row=("app", True, False))
+        finding = doctor._role_finding(bypassing)
+        self.assertEqual(finding["level"], "error")
+        safe = _FakeConnection(row=("app", False, False))
+        self.assertEqual(doctor._role_finding(safe)["level"], "ok")
+
+    @override_settings(
+        TENANT_RLS_ENABLED=True,
+        STORAGES={"default": {
+            "BACKEND": "django_tenants.files.storages.TenantFileSystemStorage"}},
+    )
+    def test_storage_finding_flags_legacy_storages_path(self):
+        # The deprecated files/storages.py wrapper (plural) has the same
+        # schema-name-based behaviour and must be flagged too.
+        finding = doctor._storage_finding()
+        self.assertEqual(finding["level"], "warning")
 
 
 if __name__ == "__main__":

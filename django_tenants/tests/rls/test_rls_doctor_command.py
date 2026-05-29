@@ -363,6 +363,10 @@ class RlsDoctorGenerateTestCase(SimpleTestCase):
             _model("app.Widget", "done"),
         ])
         legacy = self._model_obj("app.Legacy")
+        # The "missing tenant FK" problem => the model has no tenant field, so the
+        # doctor should emit the staged AddField scaffold (it now emits AddField
+        # ONLY when the FK is actually missing). get_field raising simulates that.
+        legacy._meta.get_field.side_effect = Exception("no tenant field")
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = os.path.join(tmp, "rls_scaffold")
             with mock.patch(
@@ -465,6 +469,42 @@ class RlsDoctorGenerateTestCase(SimpleTestCase):
             ):
                 _call(scan, argv=("--generate", os.path.join(tmp, "out")))
             legacy.enable_rls.assert_not_called()
+
+    def test_generate_with_json_keeps_stdout_pure_json(self):
+        # --format json + --generate: the scaffold "wrote ..." progress must go to
+        # stderr so stdout stays a single parseable JSON document for tooling.
+        scan = _scan(models=[
+            _model("app.Legacy", "generate_migration",
+                   problems=["missing tenant FK"], step=3),
+        ])
+        legacy = self._model_obj("app.Legacy")
+        legacy._meta.get_field.side_effect = Exception("no tenant field")
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "scaffold")
+            with mock.patch(
+                "django_tenants.rls.checks._iter_concrete_rls_models",
+                return_value=iter([legacy]),
+            ), mock.patch(
+                "django_tenants.rls.checks._unique_fieldsets",
+                return_value=[],
+            ), mock.patch(
+                "django_tenants.rls.scaffold.staged_fk_migration",
+                return_value="# staged\n",
+            ), mock.patch(
+                "django_tenants.rls.scaffold.enable_rls_migration",
+                return_value="# enable\n",
+            ):
+                code, out, err, _ = _call(
+                    scan, argv=("--generate", out_dir, "--format", "json"),
+                )
+            # stdout is exactly the scan JSON -- nothing else leaked into it.
+            parsed = json.loads(out)
+            self.assertEqual(parsed["summary"]["generate_migration"], 1)
+            self.assertNotIn("wrote", out)
+            # The scaffold progress went to stderr instead.
+            self.assertIn("wrote", err)
+            # generate_migration is a non-done item -> non-zero exit.
+            self.assertEqual(code, 1)
 
 
 @override_settings(TENANT_RLS_ENABLED=True)
