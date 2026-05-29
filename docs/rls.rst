@@ -322,6 +322,66 @@ During the migration itself ``TENANT_APPS`` is expected to be non-empty
 transiently as you move apps to ``SHARED_APPS``; just do not point production
 tenant traffic for those apps at the RLS-backend connection until they have moved.
 
+A minimal **permanent** hybrid uses two aliases and a router. The stock
+``TenantSyncRouter`` does not split apps across aliases, so write a small router
+that sends the schema-per-tenant apps to the legacy alias and everything else to
+the RLS alias:
+
+.. code-block:: python
+
+    # settings.py
+    DATABASES = {
+        # RLS-isolated apps (SHARED_APPS) live here, one public schema.
+        "default": {
+            "ENGINE": "django_tenants.rls.backend",
+            "NAME": "myproject",
+            # ... HOST / USER / PASSWORD / PORT ...
+        },
+        # Apps you deliberately keep schema-per-tenant live here.
+        "legacy_schema": {
+            "ENGINE": "django_tenants.postgresql_backend",
+            "NAME": "myproject",
+            # ... same database is fine; the router decides which alias ...
+        },
+    }
+
+    # The stock router still handles schema sync on whichever alias is used.
+    DATABASE_ROUTERS = ("myproject.routers.HybridRLSRouter",)
+
+.. code-block:: python
+
+    # myproject/routers.py
+    from django_tenants.routers import TenantSyncRouter
+
+    # The apps you are intentionally keeping schema-per-tenant.
+    SCHEMA_PER_TENANT_APPS = {"legacy_app"}
+    LEGACY_ALIAS = "legacy_schema"
+
+    class HybridRLSRouter(TenantSyncRouter):
+        """Route schema-per-tenant apps to the stock-backend alias; all
+        RLS-isolated apps use the default RLS-backend alias."""
+
+        def _alias_for(self, app_label):
+            return LEGACY_ALIAS if app_label in SCHEMA_PER_TENANT_APPS else "default"
+
+        def db_for_read(self, model, **hints):
+            return self._alias_for(model._meta.app_label)
+
+        def db_for_write(self, model, **hints):
+            return self._alias_for(model._meta.app_label)
+
+        def allow_migrate(self, db, app_label, model_name=None, **hints):
+            # Only let an app's tables be created on its own alias, then defer
+            # to TenantSyncRouter for the schema-vs-public decision there.
+            if self._alias_for(app_label) != db:
+                return False
+            return super().allow_migrate(db, app_label, model_name=model_name, **hints)
+
+Keep ``SCHEMA_PER_TENANT_APPS`` in ``TENANT_APPS`` (so they still get per-tenant
+schemas on the legacy alias) and every RLS app in ``SHARED_APPS``. Resolve the
+tenant on each connection independently (``TenantMainMiddleware`` for the legacy
+alias; the RLS backend's per-cursor GUC for the default alias).
+
 
 Step 5 -- Make models inherit TenantRLSModel
 ============================================
@@ -1162,7 +1222,14 @@ With ``django_tenants.rls`` installed and ``TENANT_RLS_ENABLED`` on, Django's
   checks with row security bypassed, so a global uniqueness leaks cross-tenant
   existence (see :ref:`Database constraints and covert channels
   <rls-constraints>`). The hint is to scope the constraint to the tenant, e.g.
-  ``UniqueConstraint(fields=["tenant", ...])``.
+  ``UniqueConstraint(fields=["tenant", ...])``. **W005 only sees uniqueness
+  declared on the model** (``unique=True`` / ``unique_together`` /
+  ``Meta.constraints``); uniqueness enforced in Python -- a
+  ``Model.clean()`` / ``save()`` that calls ``.filter(...).exists()`` -- is
+  invisible to it and to ``rls_doctor``. Under RLS that lookup runs *with* the
+  tenant predicate, so it silently becomes tenant-scoped; audit such code by hand
+  and either add a real ``(tenant, ...)`` ``UniqueConstraint`` or run the lookup
+  under ``bypass_rls()``.
 * **E001** -- the session/bypass variable name is not a valid PostgreSQL GUC
   variable name (it must be of the form ``<class>.<name>``).
 * **E002** -- the tenant model's primary-key type cannot be mapped to a
