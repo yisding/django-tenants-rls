@@ -23,6 +23,7 @@ W004_ID = "django_tenants_rls.W004"   # RLS not actually live on a tenant table 
 W005_ID = "django_tenants_rls.W005"   # UNIQUE constraint omits the tenant (cross-tenant leak)
 E001_ID = "django_tenants_rls.E001"   # session/bypass var names invalid (bad GUC format)
 E002_ID = "django_tenants_rls.E002"   # tenant PK type cannot be cast for RLS comparison
+E003_ID = "django_tenants_rls.E003"   # a non-FK column collides with the tenant FK column
 
 # The database ENGINE that wires up the RLS-aware DatabaseWrapper / schema editor.
 RLS_BACKEND_ENGINE = "django_tenants.rls.backend"
@@ -404,6 +405,94 @@ def check_tenant_field(app_configs, **kwargs):
     return errors
 
 
+def tenant_column_collisions(model):
+    """Return the names of non-FK fields whose column collides with the tenant FK.
+
+    ``TenantRLSModel`` contributes a ``tenant`` ForeignKey whose database column is
+    ``<tenant_field>_id`` (e.g. ``tenant_id``). A subclass that ALSO declares an
+    ordinary (non-relational) field on that same column -- a common pre-cutover
+    foot-gun is a denormalized integer ``tenant_id`` carried over from
+    schema-per-tenant data -- collides with the FK. Django itself raises
+    ``models.E006`` for the clash, but the message ("field X clashes with field Y")
+    does not explain that the conflict is with the RLS tenant FK or how to fix it.
+
+    This reusable helper finds those colliding fields so both the dedicated E003
+    system check and the ``rls_doctor`` scan can report a clear, RLS-specific
+    remediation. It compares each local field's database column to the tenant FK's
+    column, so it also catches a differently-named field that pins
+    ``db_column='<tenant_field>_id'``. The tenant FK itself (and any other relation
+    field) is skipped -- we only care about a NON-relational column squatting on the
+    tenant FK's column.
+
+    Returns a (possibly empty) list of ``(field_name, column)`` tuples. Best-effort:
+    a model whose tenant column cannot be resolved yields no collisions.
+    """
+    field = conf.tenant_field()
+    meta = model._meta
+    try:
+        tenant_fk = meta.get_field(field)
+    except Exception:
+        # No tenant FK at all (W002 territory): there is nothing to collide with.
+        return []
+    tenant_column = getattr(tenant_fk, "column", "%s_id" % field)
+
+    collisions = []
+    for other in meta.local_fields:
+        if other is tenant_fk:
+            continue
+        # Only a NON-relational field squatting on the tenant FK's column is a
+        # problem; another relation sharing the column is a different (FK) clash.
+        if getattr(other, "is_relation", False):
+            continue
+        if getattr(other, "column", None) == tenant_column:
+            collisions.append((other.name, tenant_column))
+    return collisions
+
+
+@register(deploy=True)
+def check_tenant_field_collision(app_configs, **kwargs):
+    """Error when a non-FK column on a TenantRLSModel collides with the tenant FK.
+
+    Subclassing ``TenantRLSModel`` on a model that already declares a column equal
+    to ``<tenant_field>_id`` (classically a denormalized integer ``tenant_id``
+    carried over from schema-per-tenant data) clashes with the contributed tenant
+    ForeignKey's column. Django reports this as ``models.E006``, but its generic
+    "field clashes with field" wording does not point at the RLS tenant FK or the
+    fix. This check surfaces the same clash with RLS-specific remediation so the
+    foot-gun is caught and explained at startup rather than as a cryptic E006.
+    """
+    errors = []
+    if not conf.rls_enabled():
+        return errors
+
+    field = conf.tenant_field()
+    for model in _iter_concrete_rls_models():
+        for name, column in tenant_column_collisions(model):
+            errors.append(
+                Error(
+                    "TenantRLSModel '%s' declares field '%s' on column '%s', which "
+                    "collides with the tenant ForeignKey '%s' (also column '%s'). "
+                    "RLS isolation is enforced through that tenant FK column, so a "
+                    "separate non-FK column cannot share it." % (
+                        model._meta.label, name, column, field, column,
+                    ),
+                    hint=(
+                        "Rename or drop the '%s' field (the tenant FK already "
+                        "provides the '%s' column), or, if the existing column must "
+                        "stay, point RLS at a different field by setting "
+                        "TENANT_RLS_TENANT_FIELD to another name and defining the "
+                        "tenant ForeignKey (plus a matching "
+                        "TenantPolicy(tenant_field=...)) under that name." % (
+                            name, column,
+                        )
+                    ),
+                    obj=model,
+                    id=E003_ID,
+                )
+            )
+    return errors
+
+
 @register(Tags.database, deploy=True)
 def check_rls_live(app_configs, **kwargs):
     """Warn when RLS is not actually LIVE on a tenant table (drift detection).
@@ -464,7 +553,9 @@ def _unique_fieldsets(model):
     ``label`` is a short human description of where the uniqueness comes from and
     ``fields`` is the tuple of field names it spans. Covers:
 
-    * a single field declared ``unique=True``;
+    * a single field declared ``unique=True`` (a ``OneToOneField`` is annotated
+      as such, because it is ``unique=True`` under the hood -- an easy blind spot
+      when auditing for cross-tenant uniqueness leaks);
     * each ``Meta.unique_together`` group (normalized to a list of tuples);
     * each ``Meta.constraints`` entry that is a ``UniqueConstraint`` with an
       explicit ``fields`` list (expression-based constraints have no ``fields``).
@@ -475,7 +566,15 @@ def _unique_fieldsets(model):
     for field in meta.local_fields:
         # Skip the tenant FK itself and the PK; we care about *other* unique cols.
         if getattr(field, "unique", False) and not getattr(field, "primary_key", False):
-            yield ("field %r (unique=True)" % field.name, (field.name,))
+            # A OneToOneField is unique=True implicitly (it has no explicit
+            # unique=True in the model source), so the omits-tenant warning would
+            # otherwise read as if the developer wrote unique=True -- which is a
+            # blind spot when scanning code. Spell out where the unique came from.
+            if field.get_internal_type() == "OneToOneField":
+                label = "field %r (OneToOneField, unique=True)" % field.name
+            else:
+                label = "field %r (unique=True)" % field.name
+            yield (label, (field.name,))
 
     unique_together = meta.unique_together or ()
     # unique_together may be a single tuple of field names or a tuple of tuples.

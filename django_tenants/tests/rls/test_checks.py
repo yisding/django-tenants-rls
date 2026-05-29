@@ -267,8 +267,8 @@ def _make_unique_models():
     """Build real ``TenantRLSModel`` subclasses exercising W005 conditions.
 
     Returns ``(global_unique, scoped_unique, global_unique_together,
-    scoped_unique_together, abstract)``. Requires the app registry to be
-    populated (it is under the project test runner); callers should skip the
+    scoped_unique_together, abstract, global_o2o)``. Requires the app registry to
+    be populated (it is under the project test runner); callers should skip the
     test when construction is not possible (e.g. settings not configured).
 
     * ``global_unique``            -- a bare ``unique=True`` field (LEAKS).
@@ -280,6 +280,9 @@ def _make_unique_models():
                                       (safe).
     * ``abstract``                 -- abstract subclass with a global unique;
                                       must be ignored by the check.
+    * ``global_o2o``               -- a ``OneToOneField`` (unique=True under the
+                                      hood) omitting the tenant (LEAKS); the W005
+                                      message must annotate it as a OneToOneField.
     """
     from django.db import models
 
@@ -324,12 +327,23 @@ def _make_unique_models():
             app_label = "rls"
             abstract = True
 
+    class W005GlobalOneToOne(TenantRLSModel):
+        # A OneToOneField is unique=True implicitly; it must still trip W005 when
+        # it omits the tenant, and the message must spell out the OneToOneField.
+        profile = models.OneToOneField(
+            "self", on_delete=models.CASCADE, null=True, related_name="+"
+        )
+
+        class Meta:
+            app_label = "rls"
+
     return (
         W005GlobalUnique,
         W005ScopedUnique,
         W005GlobalUniqueTogether,
         W005ScopedUniqueTogether,
         W005AbstractGlobalUnique,
+        W005GlobalOneToOne,
     )
 
 
@@ -354,6 +368,7 @@ class CheckTenantUniqueConstraintsTestCase(unittest.TestCase):
                 cls.global_unique_together,
                 cls.scoped_unique_together,
                 cls.abstract_unique,
+                cls.global_o2o,
             ) = _make_unique_models()
             cls.models_available = True
         except Exception:
@@ -394,6 +409,18 @@ class CheckTenantUniqueConstraintsTestCase(unittest.TestCase):
         self.assertEqual(_ids(messages), [checks.W005_ID])
 
     @override_settings(TENANT_RLS_ENABLED=True)
+    def test_global_one_to_one_field_warns_w005(self):
+        # A OneToOneField is unique=True under the hood; omitting the tenant
+        # leaks cross-tenant existence exactly like a unique=True field, but the
+        # source has no visible unique=True -- an easy blind spot. It must trip
+        # W005 and the message must annotate the OneToOneField.
+        with self._models(self.global_o2o):
+            messages = checks.check_tenant_unique_constraints(None)
+        self.assertEqual(_ids(messages), [checks.W005_ID])
+        self.assertIn("OneToOneField", messages[0].msg)
+        self.assertIn("profile", messages[0].msg)
+
+    @override_settings(TENANT_RLS_ENABLED=True)
     def test_tenant_scoped_unique_constraint_is_clean(self):
         with self._models(self.scoped_unique):
             self.assertEqual(checks.check_tenant_unique_constraints(None), [])
@@ -418,6 +445,136 @@ class CheckTenantUniqueConstraintsTestCase(unittest.TestCase):
             messages = checks.check_tenant_unique_constraints(None)
         # Two leaky models -> two W005 warnings; the scoped one stays clean.
         self.assertEqual(_ids(messages), [checks.W005_ID, checks.W005_ID])
+
+    def test_unique_fieldsets_annotates_one_to_one_field(self):
+        # The shared enumeration (used by both W005 and the doctor) labels a
+        # OneToOneField distinctly from a plain unique=True field so the leak
+        # report makes the implicit uniqueness explicit. A plain unique field
+        # keeps the bare "(unique=True)" wording.
+        o2o_labels = [label for label, _ in checks._unique_fieldsets(self.global_o2o)]
+        self.assertTrue(any("OneToOneField" in label for label in o2o_labels))
+        plain_labels = [label for label, _ in checks._unique_fieldsets(self.global_unique)]
+        self.assertTrue(any("(unique=True)" in label for label in plain_labels))
+        self.assertFalse(any("OneToOneField" in label for label in plain_labels))
+
+
+def _make_collision_models():
+    """Build ``TenantRLSModel`` subclasses exercising the E003 collision check.
+
+    Returns ``(collide_same_name, collide_db_column, clean)``. Requires the app
+    registry to be populated; callers should skip when construction fails.
+
+    * ``collide_same_name`` -- declares a non-FK ``tenant_id`` field, colliding
+      with the contributed tenant FK's ``tenant_id`` column (the denormalized
+      ``tenant_id`` foot-gun; Django reports this as models.E006).
+    * ``collide_db_column``  -- a differently-named field that pins
+      ``db_column='tenant_id'``, colliding on the same column.
+    * ``clean``              -- an ordinary subclass with no colliding column.
+    """
+    from django.db import models
+
+    from django_tenants.rls.models import TenantRLSModel
+
+    class E003CollideSameName(TenantRLSModel):
+        tenant_id = models.IntegerField()
+
+        class Meta:
+            app_label = "rls"
+
+    class E003CollideDbColumn(TenantRLSModel):
+        legacy_tenant = models.IntegerField(db_column="tenant_id")
+
+        class Meta:
+            app_label = "rls"
+
+    class E003Clean(TenantRLSModel):
+        note = models.CharField(max_length=20, blank=True, default="")
+
+        class Meta:
+            app_label = "rls"
+
+    return E003CollideSameName, E003CollideDbColumn, E003Clean
+
+
+class TenantColumnCollisionsTestCase(unittest.TestCase):
+    """E003: a non-FK column colliding with the tenant FK column is an error.
+
+    Subclassing ``TenantRLSModel`` contributes a ``tenant`` ForeignKey on column
+    ``<tenant_field>_id`` (``tenant_id``). A model that ALSO declares an ordinary
+    field on that column (classically a denormalized integer ``tenant_id`` from
+    schema-per-tenant data) clashes with it. Django reports the clash as a generic
+    ``models.E006``; the E003 check surfaces the same clash with RLS-specific
+    remediation. The reusable ``checks.tenant_column_collisions(model)`` helper is
+    composed by the doctor too. Pure model introspection -- no database.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        try:
+            (
+                cls.collide_same_name,
+                cls.collide_db_column,
+                cls.clean,
+            ) = _make_collision_models()
+            cls.models_available = True
+        except Exception:
+            cls.models_available = False
+
+    def setUp(self):
+        if not getattr(self, "models_available", False):
+            self.skipTest("app registry not configured for TenantRLSModel models")
+
+    @contextlib.contextmanager
+    def _models(self, *model_classes):
+        with mock.patch("django.apps.apps.get_models", return_value=list(model_classes)):
+            yield
+
+    def test_helper_detects_same_name_collision(self):
+        collisions = checks.tenant_column_collisions(self.collide_same_name)
+        self.assertEqual(collisions, [("tenant_id", "tenant_id")])
+
+    def test_helper_detects_db_column_collision(self):
+        collisions = checks.tenant_column_collisions(self.collide_db_column)
+        self.assertEqual(collisions, [("legacy_tenant", "tenant_id")])
+
+    def test_helper_clean_model_has_no_collision(self):
+        self.assertEqual(checks.tenant_column_collisions(self.clean), [])
+
+    @override_settings(TENANT_RLS_ENABLED=False)
+    def test_check_silent_when_disabled(self):
+        with self._models(self.collide_same_name):
+            self.assertEqual(checks.check_tenant_field_collision(None), [])
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_check_errors_e003_for_same_name_collision(self):
+        with self._models(self.collide_same_name):
+            messages = checks.check_tenant_field_collision(None)
+        self.assertEqual(_ids(messages), [checks.E003_ID])
+        self.assertIsInstance(messages[0], Error)
+        # The message must name the colliding field, the tenant column and FK.
+        self.assertIn("tenant_id", messages[0].msg)
+        self.assertIn("tenant", messages[0].msg)
+        # The hint must offer the two documented remediations.
+        self.assertIn("TENANT_RLS_TENANT_FIELD", messages[0].hint)
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_check_errors_e003_for_db_column_collision(self):
+        with self._models(self.collide_db_column):
+            messages = checks.check_tenant_field_collision(None)
+        self.assertEqual(_ids(messages), [checks.E003_ID])
+        self.assertIn("legacy_tenant", messages[0].msg)
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_check_clean_model_is_silent(self):
+        with self._models(self.clean):
+            self.assertEqual(checks.check_tenant_field_collision(None), [])
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_check_flags_only_the_colliding_model(self):
+        with self._models(self.collide_same_name, self.clean, self.collide_db_column):
+            messages = checks.check_tenant_field_collision(None)
+        self.assertEqual(_ids(messages), [checks.E003_ID, checks.E003_ID])
 
 
 def _make_live_model():

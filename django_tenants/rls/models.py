@@ -11,16 +11,23 @@ Subclasses gain:
 * a ``tenant`` ``ForeignKey`` to ``settings.TENANT_MODEL`` (the attribute name is
   literally ``tenant``; if you override ``TENANT_RLS_TENANT_FIELD`` you must define
   your own FK with that name and a matching ``TenantPolicy``);
-* automatic population of ``tenant_id`` from the active connection's tenant in
-  ``save()`` (so existing code that never passes ``tenant`` keeps working);
+* automatic population of ``tenant_id`` from the active connection's tenant. The
+  stamp happens in ``full_clean()`` (so a model validated before it is saved does
+  not trip "tenant cannot be null"), again in ``save()`` (idempotent, for code
+  that never validates), and in the default manager's ``bulk_create()`` (which
+  bypasses ``save()`` entirely), so existing code that never passes ``tenant``
+  keeps working;
 * ``enable_rls()`` / ``disable_rls()`` classmethods that apply RLS + policies.
 
 Policies are collected from ``Meta.rls_policies`` if present; otherwise a single
 default :class:`~django_tenants.rls.policies.TenantPolicy` is built lazily at
 enable time (so ``conf.*`` settings are read then, not at class-definition time).
 
-The default manager is intentionally unchanged: the database enforces filtering
-via RLS, so no tenant-filtering manager is added.
+The default manager does NOT filter rows -- the database enforces tenant
+filtering via RLS, so no tenant-filtering manager is added. The only behavior the
+default :class:`TenantRLSManager` adds over a plain ``Manager`` is auto-stamping
+``tenant_id`` on the unsaved instances passed to ``bulk_create()`` (which never
+calls ``save()`` and so would otherwise leave the FK NULL).
 """
 
 import hashlib
@@ -93,6 +100,80 @@ def _validate_policies(policies):
                 "Meta.rls_policies entries must be BasePolicy instances, got %r."
                 % type(policy).__name__
             )
+
+
+def _resolve_active_tenant_id(using):
+    """Resolve the active tenant pk/id from the ``using`` connection, or None.
+
+    Shared source-of-truth resolution used by ``TenantRLSModel.full_clean()``,
+    ``TenantRLSModel.save()`` and ``TenantRLSManager.bulk_create()`` so all three
+    auto-stamp paths agree on where the tenant comes from. The GUC is the source
+    of truth -- it is what actually scopes the row in the database, and
+    ``rls_context()``/``bypass_rls()`` set it without ever touching
+    ``connection.tenant``:
+
+    1. ``connection._rls_tenant_id`` -- the value pushed into the Postgres session
+       GUC by the RLS backend -- if it is a non-empty string;
+    2. otherwise ``connection.tenant.pk`` if a tenant object is bound;
+    3. otherwise ``None`` (no active tenant; callers leave the FK unset).
+
+    ``using`` is the database alias of the connection to read; callers resolve it
+    (explicit ``using=`` > the instance's bound ``self._state.db`` > the tenant
+    database alias) so a multi-database write is stamped from the right connection.
+    """
+    from django.db import connections
+
+    conn = connections[using]
+    # (a) GUC source of truth first: rls_context()+create() sets this but never
+    # connection.tenant, so this must win over the bound object.
+    rls_tenant_id = getattr(conn, "_rls_tenant_id", None)
+    if isinstance(rls_tenant_id, str) and rls_tenant_id != "":
+        return rls_tenant_id
+    # (b) fall back to the bound tenant object's pk.
+    tenant = getattr(conn, "tenant", None)
+    return getattr(tenant, "pk", None)
+
+
+class TenantRLSManager(models.Manager):
+    """Default manager for :class:`TenantRLSModel`.
+
+    Deliberately does NOT filter querysets by tenant -- isolation is enforced by
+    the database RLS policies, so the base queryset is the stock unfiltered one
+    (preserving the "default manager is unchanged" contract). The single behavior
+    it adds is auto-stamping ``tenant_id`` in :meth:`bulk_create`, which bypasses
+    ``save()`` (and therefore the ``save()``/``full_clean()`` auto-stamp) entirely
+    and would otherwise insert rows with a NULL tenant FK.
+    """
+
+    def bulk_create(self, objs, *args, **kwargs):
+        """Stamp ``tenant_id`` on each unsaved instance, then bulk insert.
+
+        ``bulk_create()`` does not call ``Model.save()``, so the ordinary
+        auto-stamp never runs; we replicate it here on each instance whose tenant
+        FK is unset. An explicitly-set tenant is preserved and an explicit
+        ``using=`` is honored (it overrides the per-instance bound db). When RLS is
+        disabled this is a no-op and the call is a plain ``bulk_create()``.
+
+        ``objs`` may be any iterable; Django materializes it to a list internally,
+        so we materialize once up front to both stamp and forward the same list.
+        """
+        objs = list(objs)
+        if conf.rls_enabled():
+            field = conf.tenant_field()
+            attname = "%s_id" % field
+            explicit_using = kwargs.get("using")
+            for obj in objs:
+                if getattr(obj, attname, None) not in (None, ""):
+                    continue
+                using = (
+                    explicit_using
+                    or obj._state.db
+                    or get_tenant_database_alias()
+                )
+                tenant_id = _resolve_active_tenant_id(using)
+                if tenant_id is not None:
+                    setattr(obj, attname, tenant_id)
+        return super().bulk_create(objs, *args, **kwargs)
 
 
 class RLSModelMeta(models.base.ModelBase):
@@ -171,6 +252,12 @@ class TenantRLSModel(models.Model, metaclass=RLSModelMeta):
         related_name="+",
     )
 
+    # Default manager. It does not filter (RLS does) -- it only adds bulk_create()
+    # tenant auto-stamping. Set as the default so bulk_create() picks up stamping
+    # without subclasses having to opt in; subclasses are still free to declare
+    # their own ``objects``.
+    objects = TenantRLSManager()
+
     class Meta:
         abstract = True
 
@@ -241,6 +328,46 @@ class TenantRLSModel(models.Model, metaclass=RLSModelMeta):
             # rows so a non-existent relation never blocks migrate or the command.
             return False
 
+    def _autostamp_tenant(self, using=None):
+        """Populate the tenant FK from the active connection when it is unset.
+
+        Shared by :meth:`full_clean` and :meth:`save` so both stamp from the same
+        source of truth (see :func:`_resolve_active_tenant_id`). It is idempotent
+        and never overwrites an explicitly-set tenant, so calling it from both
+        ``full_clean()`` and ``save()`` is safe. When RLS is disabled it is a
+        no-op: the connection is not even consulted (behavior identical to a plain
+        model). Returns ``None``.
+
+        ``using`` (if given) overrides the connection-resolution order; otherwise
+        the instance's bound db (``self._state.db``) then the tenant database alias
+        are used, so a multi-database write is stamped from the right connection.
+
+        The resolved value (e.g. the string ``"5"``) is assigned to ``<fk>_id``;
+        Django coerces it via the FK target field on save.
+        """
+        field = conf.tenant_field()
+        attname = "%s_id" % field
+        if not conf.rls_enabled() or getattr(self, attname, None) not in (None, ""):
+            return
+        using = using or self._state.db or get_tenant_database_alias()
+        tenant_id = _resolve_active_tenant_id(using)
+        if tenant_id is not None:
+            setattr(self, attname, tenant_id)
+
+    def full_clean(self, *args, **kwargs):
+        """Auto-stamp the tenant FK *before* validating.
+
+        A model whose code calls ``full_clean()`` before ``save()`` (e.g. a
+        ``ModelForm`` or an explicit validation step) would otherwise fail with
+        "tenant cannot be null", because the ``save()``-time stamp comes too late
+        for validation. Stamping here -- from the same source of truth ``save()``
+        uses -- makes the FK present when ``super().full_clean()`` runs. The
+        ``save()`` stamp is kept too (idempotent) for code that never validates.
+        An explicitly-set tenant is preserved and RLS-disabled is a no-op.
+        """
+        self._autostamp_tenant()
+        super().full_clean(*args, **kwargs)
+
     def save(self, *args, **kwargs):
         """
         Auto-populate the tenant FK from the active connection when unset.
@@ -251,43 +378,11 @@ class TenantRLSModel(models.Model, metaclass=RLSModelMeta):
         overwritten. When RLS is disabled this is a no-op (behavior identical to a
         plain model).
 
-        Resolution order (the GUC is the source of truth -- it is what actually
-        scopes the row in the database, and ``rls_context()``/``bypass_rls()`` set
-        it without ever touching ``connection.tenant``):
-
-        1. ``connection._rls_tenant_id`` -- the value pushed into the Postgres
-           session GUC by the RLS backend -- if it is a non-empty string;
-        2. otherwise ``connection.tenant.pk`` if a tenant object is bound.
-
-        The resolved value (e.g. the string ``"5"``) is assigned to ``<fk>_id``;
-        Django coerces it via the FK target field on save.
+        The stamp also runs in :meth:`full_clean` (so validation before save does
+        not trip "tenant cannot be null"); doing it again here is idempotent and
+        covers code that saves without validating.
         """
-        field = conf.tenant_field()
-        attname = "%s_id" % field
-        if conf.rls_enabled() and getattr(self, attname, None) in (None, ""):
-            from django.db import connections
-
-            # Resolve the connection actually used for THIS save so a multi-database
-            # write is stamped from the right connection's tenant, not always the
-            # default tenant alias: explicit using= > the instance's bound db
-            # (self._state.db) > the tenant database alias.
-            using = (
-                kwargs.get("using")
-                or self._state.db
-                or get_tenant_database_alias()
-            )
-            conn = connections[using]
-            # (a) GUC source of truth first: rls_context()+create() sets this but
-            # never connection.tenant, so this must win over the bound object.
-            rls_tenant_id = getattr(conn, "_rls_tenant_id", None)
-            if isinstance(rls_tenant_id, str) and rls_tenant_id != "":
-                setattr(self, attname, rls_tenant_id)
-            else:
-                # (b) fall back to the bound tenant object's pk.
-                tenant = getattr(conn, "tenant", None)
-                pk = getattr(tenant, "pk", None)
-                if pk is not None:
-                    setattr(self, attname, pk)
+        self._autostamp_tenant(using=kwargs.get("using"))
         super().save(*args, **kwargs)
 
     @classmethod
