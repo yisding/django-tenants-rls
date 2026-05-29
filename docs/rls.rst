@@ -351,18 +351,21 @@ the RLS alias:
 .. code-block:: python
 
     # myproject/routers.py
+    from django.conf import settings
     from django_tenants.routers import TenantSyncRouter
+    from django_tenants.utils import get_public_schema_name
 
     # The apps you are intentionally keeping schema-per-tenant.
     SCHEMA_PER_TENANT_APPS = {"legacy_app"}
     LEGACY_ALIAS = "legacy_schema"
+    RLS_ALIAS = "default"
 
     class HybridRLSRouter(TenantSyncRouter):
         """Route schema-per-tenant apps to the stock-backend alias; all
         RLS-isolated apps use the default RLS-backend alias."""
 
         def _alias_for(self, app_label):
-            return LEGACY_ALIAS if app_label in SCHEMA_PER_TENANT_APPS else "default"
+            return LEGACY_ALIAS if app_label in SCHEMA_PER_TENANT_APPS else RLS_ALIAS
 
         def db_for_read(self, model, **hints):
             return self._alias_for(model._meta.app_label)
@@ -371,16 +374,42 @@ the RLS alias:
             return self._alias_for(model._meta.app_label)
 
         def allow_migrate(self, db, app_label, model_name=None, **hints):
-            # Only let an app's tables be created on its own alias, then defer
-            # to TenantSyncRouter for the schema-vs-public decision there.
+            # 1) Each app's tables live on exactly one alias.
             if self._alias_for(app_label) != db:
                 return False
-            return super().allow_migrate(db, app_label, model_name=model_name, **hints)
+            # 2) RLS alias: one public schema, everything is in SHARED_APPS.
+            #    (Do NOT delegate to super(): TenantSyncRouter.allow_migrate
+            #    hard-gates `db != get_tenant_database_alias()`, which is a single
+            #    global alias -- so it returns False for the legacy alias and the
+            #    schema-per-tenant tables would never be created there.)
+            if db == RLS_ALIAS:
+                return None
+            # 3) Legacy alias: reproduce django-tenants' public-vs-tenant-schema
+            #    gating for THIS connection, so TENANT_APPS tables are created only
+            #    in tenant schemas (not the legacy public schema).
+            from django.db import connections
+            connection = connections[db]
+            if connection.schema_name == get_public_schema_name():
+                installed_apps = settings.SHARED_APPS
+            else:
+                installed_apps = settings.TENANT_APPS
+            return None if self.app_in_list(app_label, installed_apps) else False
 
 Keep ``SCHEMA_PER_TENANT_APPS`` in ``TENANT_APPS`` (so they still get per-tenant
 schemas on the legacy alias) and every RLS app in ``SHARED_APPS``. Resolve the
 tenant on each connection independently (``TenantMainMiddleware`` for the legacy
 alias; the RLS backend's per-cursor GUC for the default alias).
+
+.. note::
+
+   A permanent multi-database hybrid is **advanced**. ``allow_migrate`` above is
+   self-contained on purpose -- it does not call ``super()`` because
+   ``TenantSyncRouter`` gates migrations to one global ``get_tenant_database_alias()``.
+   Drive the schema-per-tenant migrations on the legacy alias with
+   ``migrate_schemas`` (which iterates that connection's schemas), validate with a
+   two-tenant isolation check on **both** connections, and prefer the temporary
+   incremental hybrid above unless you genuinely need two permanent backends. The
+   ``has_multi_type_tenants()`` case needs additional handling not shown here.
 
 
 Step 5 -- Make models inherit TenantRLSModel
