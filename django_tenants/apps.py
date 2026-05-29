@@ -10,6 +10,21 @@ Please see https://django-tenants.readthedocs.io/en/latest/install.html?highligh
 """
 
 
+def _rls_enabled():
+    """Whether shared-schema RLS mode is enabled, read straight from settings.
+
+    Kept dependency-free (no import of the optional ``django_tenants.rls``
+    subpackage) so core config validation never couples to it. Mirrors the
+    resolution order used by ``django_tenants.rls.conf``: the individual
+    top-level ``TENANT_RLS_ENABLED`` wins, then the grouped ``DJANGO_TENANTS_RLS``
+    dict, then the default (off).
+    """
+    value = getattr(settings, 'TENANT_RLS_ENABLED', None)
+    if value is None:
+        value = getattr(settings, 'DJANGO_TENANTS_RLS', {}).get('TENANT_RLS_ENABLED', False)
+    return bool(value)
+
+
 class DjangoTenantsConfig(AppConfig):
     name = 'django_tenants'
     verbose_name = "Django tenants"
@@ -31,7 +46,11 @@ class DjangoTenantsConfig(AppConfig):
             if not hasattr(settings, 'TENANT_APPS'):
                 raise ImproperlyConfigured('TENANT_APPS setting not set')
 
-            if not settings.TENANT_APPS:
+            if not settings.TENANT_APPS and not _rls_enabled():
+                # In shared-schema RLS mode there is exactly one schema (public)
+                # and every isolated app lives in SHARED_APPS, so an empty
+                # TENANT_APPS is the correct RLS-only end state. Only enforce the
+                # non-empty rule when RLS is NOT enabled.
                 raise ImproperlyConfigured("TENANT_APPS is empty. "
                                            "Maybe you don't need this app?")
 
