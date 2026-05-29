@@ -190,6 +190,26 @@ class RlsDoctorReportTestCase(SimpleTestCase):
             passed = scan_mock.call_args.args[0]
         self.assertEqual(passed, "replica")
 
+    def test_scope_hint_when_no_models(self):
+        # With zero TenantRLSModel subclasses the report must explain the doctor's
+        # blind spots (don't let an empty exit-0 report read as "migration done")
+        # and surface installed third-party tenant-resident apps.
+        scan = _scan(models=[])
+        code, out, err, _ = _call(scan)
+        self.assertIsNone(code)  # nothing failing -> exit 0
+        self.assertIn("only inspects concrete TenantRLSModel subclasses", out)
+        self.assertIn("does NOT mean the migration is done", out)
+        # auth + sessions are in the test INSTALLED_APPS -> flagged as third-party
+        # tenant-resident reminders.
+        self.assertIn("django.contrib.auth", out)
+        self.assertIn("django_session", out)
+
+    def test_no_scope_hint_when_models_present(self):
+        # The hint is only for the empty case; a normal report should not carry it.
+        scan = _scan(models=[_model("app.W", "done")])
+        code, out, err, _ = _call(scan)
+        self.assertNotIn("only inspects concrete TenantRLSModel subclasses", out)
+
 
 @override_settings(TENANT_RLS_ENABLED=True)
 class RlsDoctorJsonTestCase(SimpleTestCase):

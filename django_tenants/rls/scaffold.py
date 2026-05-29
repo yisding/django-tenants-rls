@@ -299,8 +299,16 @@ def third_party_policy_sql(table, *, pk_cast="integer"):
 -- USING / WITH CHECK expressions come straight from TenantPolicy, so "{table}"
 -- is policed exactly like a managed table.
 --
--- Assumes "{table}" has a "{field}_id" column referencing the tenant PK (cast
--- {pk_cast}). Drop any existing same-named policy first so this is re-runnable.
+-- PREREQUISITE -- this scaffold emits ONLY the policy. It assumes "{table}"
+-- ALREADY has a NOT NULL "{field}_id" column (type matching the tenant PK, cast
+-- {pk_cast}) and that it has been backfilled. If the table has no tenant column
+-- yet (the usual case for authtoken/auth/sessions), FIRST run, in order:
+--   ALTER TABLE {q_table} ADD COLUMN {field}_id <pk type> NULL REFERENCES ...;
+--   UPDATE {q_table} SET {field}_id = <owner> WHERE {field}_id IS NULL;  -- backfill
+--   ALTER TABLE {q_table} ALTER COLUMN {field}_id SET NOT NULL;
+--   -- and tenant-scope any global UNIQUE (e.g. UNIQUE ({field}_id, <key>))
+-- See docs/rls_migration.rst "Third-party / non-policied tables".
+-- Drop any existing same-named policy first so this is re-runnable.
 
 ALTER TABLE {q_table} ENABLE ROW LEVEL SECURITY;
 -- FORCE so the policy also applies to the table owner role:
@@ -429,6 +437,35 @@ def _unique_source_kind(model, fields):
     return "constraint", None
 
 
+def _render_field_without_unique(model, field_name):
+    """Render ``model.field_name`` as migration source with ``unique`` stripped.
+
+    Uses Django's own migration serializer so the field's REAL type and options
+    are reproduced (max_length, choices, etc.) instead of a hardcoded placeholder
+    that would silently change the column. Best-effort: if the field cannot be
+    reconstructed (exotic custom field, import failure) it returns a clearly
+    flagged placeholder so the scaffold never crashes.
+    """
+    fallback = (
+        "models.CharField(max_length=255, unique=False)"
+        "  # TODO: could not introspect -- replace with your real field"
+    )
+    try:
+        from django.db.migrations.writer import MigrationWriter
+        from django.utils.module_loading import import_string
+
+        field = model._meta.get_field(field_name)
+        _name, path, args, kwargs = field.deconstruct()
+        # unique defaults to False, so dropping it makes the field non-unique.
+        kwargs.pop("unique", None)
+        field_cls = import_string(path)
+        rebuilt = field_cls(*args, **kwargs)
+        src, _imports = MigrationWriter.serialize(rebuilt)
+        return src
+    except Exception:
+        return fallback
+
+
 def _unique_removal_op(model, fields):
     """Return the migration-operation text to drop the old tenant-blind UNIQUE.
 
@@ -455,14 +492,16 @@ def _unique_removal_op(model, fields):
         )
     if kind == "field":
         fld = fields_t[0] if fields_t else "<field>"
+        field_src = _render_field_without_unique(model, fld)
         return (
-            "        # Old UNIQUE is a field-level unique=True. Copy your REAL field\n"
-            "        # definition here with unique=False (same type and options).\n"
+            "        # Old UNIQUE is a field-level unique=True. The field below is\n"
+            "        # reconstructed from your model with unique dropped; review it\n"
+            "        # (and add any custom-field import the scaffold could not infer).\n"
             "        migrations.AlterField(\n"
             '            model_name="%s",\n'
             '            name="%s",\n'
-            "            field=models.CharField(max_length=255, unique=False),  # TODO: your field\n"
-            "        )," % (model_name, fld)
+            "            field=%s,\n"
+            "        )," % (model_name, fld, field_src)
         )
     name = cname or "<old_constraint_name>"
     todo = "" if cname else (

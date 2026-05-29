@@ -322,6 +322,12 @@ class ReviewFixScaffoldTestCase(_ScaffoldBase):
         text = scaffold.unique_constraint_migration(self.global_unique, ["email"])
         self.assertIn("migrations.AlterField(", text)
         self.assertNotIn("migrations.RemoveConstraint(", text)
+        # The AlterField must reproduce the REAL field type (email is an
+        # EmailField), not the old hardcoded CharField(max_length=255) placeholder
+        # that would silently change the column.
+        self.assertIn("EmailField", text)
+        self.assertNotIn("max_length=255", text)
+        self.assertNotIn("could not introspect", text)
         compile(text, "<unique>", "exec")  # valid Python module
 
     @override_settings(TENANT_RLS_ENABLED=True)

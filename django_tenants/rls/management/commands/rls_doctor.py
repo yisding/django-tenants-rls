@@ -191,6 +191,7 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING(
                 "  no concrete TenantRLSModel subclasses found."
             ))
+            self._print_scope_hint()
             return
 
         by_class = {}
@@ -233,6 +234,44 @@ class Command(BaseCommand):
                     self.stdout.write(
                         "        see docs/rls_migration.rst step %s" % step
                     )
+
+    # Known third-party apps whose tables are commonly tenant-resident but can
+    # NEVER subclass TenantRLSModel, so the doctor cannot see or fix them -- they
+    # need a hand-written tenant_id column + policy (migration guide, Step 7).
+    _THIRD_PARTY_TENANT_APPS = {
+        "rest_framework.authtoken": "authtoken_token",
+        "django.contrib.auth": "auth_user / auth_group",
+        "django.contrib.sessions": "django_session",
+    }
+
+    def _print_scope_hint(self):
+        """Explain the doctor's blind spots when no model subclasses the base.
+
+        Prevents the false-comfort of an empty, exit-0 report mid-migration: the
+        doctor only inspects ``TenantRLSModel`` subclasses (plus settings), so it
+        is silent about un-converted models and third-party tenant tables.
+        """
+        from django.conf import settings
+
+        self.stdout.write(self.style.NOTICE(
+            "  Note: rls_doctor only inspects concrete TenantRLSModel subclasses\n"
+            "  (plus the settings checks above). It does NOT see models you have\n"
+            "  not converted yet, nor third-party tables that cannot subclass the\n"
+            "  base. An empty/all-clear report does NOT mean the migration is done."
+        ))
+        installed = set(getattr(settings, "INSTALLED_APPS", ()) or ())
+        present = [(app, tbl) for app, tbl in self._THIRD_PARTY_TENANT_APPS.items()
+                   if app in installed]
+        if present:
+            self.stdout.write(self.style.NOTICE(
+                "  Third-party apps installed whose tenant data needs a HAND-WRITTEN\n"
+                "  tenant_id column + policy (if they hold per-tenant data):"
+            ))
+            for app, tbl in present:
+                self.stdout.write("      - %s (%s)" % (app, tbl))
+            self.stdout.write(
+                "  See docs/rls_migration.rst 'Third-party / non-policied tables'."
+            )
 
     def _print_summary(self, summary):
         self.stdout.write(self.style.MIGRATE_HEADING("\nSummary:"))
