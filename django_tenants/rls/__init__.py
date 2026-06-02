@@ -52,6 +52,8 @@ _LAZY_EXPORTS = {
     "set_current_tenant": "session",
     "clear_current_tenant": "session",
     "get_current_tenant_id": "session",
+    "require_current_tenant": "session",
+    "NoActiveTenant": "session",
     "set_bypass": "session",
     "get_bypass": "session",
 }
@@ -67,6 +69,8 @@ __all__ = [
     "set_current_tenant",
     "clear_current_tenant",
     "get_current_tenant_id",
+    "require_current_tenant",
+    "NoActiveTenant",
     "set_bypass",
     "get_bypass",
 ]
