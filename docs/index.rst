@@ -75,6 +75,7 @@ Contents
    install
    use
    rls
+   rls_migration
    examples
    files
    test
