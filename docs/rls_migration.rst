@@ -326,13 +326,65 @@ on.
 Prerequisites and the least-privilege database role
 ====================================================
 
-Before you move a single row, three things must be true: you are on a
-PostgreSQL that supports row-level security, your application is wired to the
-RLS backend, and -- the one mistake that silently destroys isolation -- your
-application connects as a role that **cannot** bypass RLS. Get the role wrong
-and every other step in this guide is theatre: the policies exist, the tables
-report as protected, every query succeeds, and there is *zero* tenant
-isolation.
+Before you move a single row, four things must be true: the
+``django_tenants.rls`` subpackage is actually installed and importable in every
+environment, you are on a PostgreSQL that supports row-level security, your
+application is wired to the RLS backend, and -- the one mistake that silently
+destroys isolation -- your application connects as a role that **cannot** bypass
+RLS. Get the role wrong and every other step in this guide is theatre: the
+policies exist, the tables report as protected, every query succeeds, and there
+is *zero* tenant isolation.
+
+Installing an RLS-capable django-tenants
+----------------------------------------
+
+This is the **first** prerequisite, and the first wall every migrator hits.
+Shared-schema RLS is **not** shipped in any current public PyPI
+``django-tenants`` release. The moment you convert one model or one settings
+line to import ``django_tenants.rls``, every environment whose dependency still
+resolves to the public package -- local dev, CI, the migration-check job, and
+production -- dies at *import* with::
+
+    ModuleNotFoundError: No module named 'django_tenants.rls'
+
+before a single test runs. There is no graceful degradation: the converted code
+cannot be imported at all.
+
+So before you convert any models, make ``django_tenants.rls`` resolvable
+everywhere:
+
+#. **Pin a source that ships the** ``rls`` **subpackage in your project's
+   dependency metadata AND your lockfile** -- not in one CI workflow's ad-hoc
+   ``pip install``. Until there is an upstream release that contains it, that
+   means a fork branch/tag (e.g. a VCS pin); once an RLS release exists, pin the
+   documented version floor instead. The pin must live where *every* environment
+   resolves it: ``requirements.txt`` / ``pyproject.toml`` **and** the committed
+   lockfile (``poetry.lock``, ``uv.lock``, ``pip``'s pinned file, …). A pin in a
+   single ``.github/workflows`` step does not protect local dev, the
+   migrate-check job, or prod, so isolation passes CI and then the deploy dies at
+   import.
+#. **Verify from a clean environment before converting anything.** From a fresh
+   checkout/virtualenv that installed only your locked dependencies, run::
+
+       python -c "import django_tenants.rls"
+
+   (or ``uv sync && python manage.py check``, ``pip install -e . && …`` -- use
+   whatever your project uses). If that import succeeds, your build contains the
+   RLS subpackage and a forgotten pin becomes a one-line install fix rather than
+   a red suite mid-migration.
+
+This is source-agnostic: pip, uv, and poetry all express the same pin and the
+same lockfile; the only requirement is that the *resolved* distribution contains
+``django_tenants.rls``.
+
+.. note::
+
+   The companion reference (:doc:`rls`) states that RLS "ships inside the
+   ``django-tenants`` package; there is nothing extra to install." That is true
+   only for a wheel **built from a tree that ships the** ``rls`` **subpackages**
+   -- it is *not* true for an arbitrary public PyPI pin that may predate the RLS
+   release. If your lockfile resolves to such a release, the package is missing
+   regardless of that statement; pin a source that includes it, as above.
 
 PostgreSQL and the RLS backend
 ------------------------------
@@ -1612,6 +1664,34 @@ The reference recipe (:ref:`rls-backfill-recipe`) shows the exact
 wrapper, and the closing ``count(*) WHERE tenant_id IS NULL`` assertion. Start
 from that and adapt the column list per table.
 
+.. important::
+
+   **This recipe DERIVES** ``tenant_id`` **from the source schema the row lived
+   in.** That assumption -- "the row's owner is the tenant whose schema it sits
+   in" -- holds for ordinary per-tenant data, but it **breaks for two populations
+   that have no schema-derivable owner**, and for those the loop above silently
+   produces the wrong answer:
+
+   * **(a) Seed / self-referential / global-ish "root" rows** that live inside an
+     otherwise-isolated table but whose true owner is *not* "the schema they sit
+     in" -- shared seed data duplicated into every schema, a self-referential
+     root node, or a row that is conceptually global. A naive per-schema stamp
+     either duplicates it once per tenant or assigns it an arbitrary tenant.
+   * **(b) Auth / session / contrib tables** (``auth_user``, ``django_session``,
+     and friends) whose owner must be resolved from a **membership / user ->
+     tenant mapping**, not from the schema. There is no ``<schema>`` to stamp
+     from for a table that was global to begin with.
+
+   For both, the recipe's closing ``count(*) WHERE tenant_id IS NULL == 0``
+   assertion (and the subsequent ``AlterField`` to ``SET NOT NULL``) will
+   **FAIL** -- or, worse, a naive stamp silently assigns a wrong/arbitrary tenant
+   -- until you supply a *real owner-resolution query* for those rows. This is a
+   per-table planning decision to settle during :ref:`Step 1 classification
+   <rls-migration-assessment>` **before** cutover, not something to discover
+   mid-backfill. For case (b) see :ref:`rls-migration-auth-decision` (deciding
+   whether and how to isolate auth/sessions); for the ``SET NOT NULL`` /
+   invisible-row consequence see :ref:`rls-null-rows`.
+
 Why ``bypass_rls()`` is mandatory here
 --------------------------------------
 
@@ -2049,6 +2129,60 @@ environment to be reconstructable from migrations alone. Option B is simplest
 for a one-time, hands-on production cutover. Both are correct for an upgrade;
 Option A is not.
 
+.. _rls-migration-codify-cutover:
+
+Codify the cutover: apply to ALL tables, then verify
+----------------------------------------------------
+
+Picking Option B or C is only half the job. The cutover is **not done until
+every isolated table is covered** -- and "every table" includes the
+external/contrib/M2M tables that no shipped verifier looks at by default. The
+two rules:
+
+**Pick ONE production mechanism, and make sure it actually runs in prod.** Do
+not enable some tables by hand in a shell and others via a migration and hope
+they converge. Choose one of:
+
+#. **Committed migrations (Option C) for everything.** ``EnableRLS`` +
+   ``CreateTenantPolicy`` per ``TenantRLSModel``, **and** an
+   ``IsolateExternalTable`` operation (or the guarded ``RunPython`` from
+   :ref:`rls-migration-vendor-guard`) per external table -- ``authtoken_token``,
+   the ``django.contrib`` auth/session tables you decided to isolate, and any M2M
+   through-tables. A fresh ``migrate`` then reconstructs the *full* enforcement
+   surface, with nothing applied out of band.
+#. **A required, idempotent cutover job.** A deploy step that runs
+   ``manage.py enable_rls`` (or ``rls_doctor --fix``) **and** the external-table
+   DDL, gated so the deploy fails unless ``manage.py verify_rls`` exits ``0``.
+   Idempotent so a retry is safe; required so it cannot be skipped.
+
+Whichever you pick, do **not** rely on ``TENANT_RLS_AUTO_ENABLE = True`` against
+a populated database (it is greenfield-only -- see Option A) and do **not** treat
+a single hand-run as the production mechanism.
+
+**A green doctor/verify_rls is not proof the cutover is complete.** By default
+``rls_doctor`` and ``verify_rls`` enumerate only concrete ``TenantRLSModel``
+subclasses, so an unprotected ``authtoken_token`` (or any contrib/M2M table that
+cannot subclass ``TenantRLSModel``) **passes the gate silently** -- it sits in
+``public`` with no policy, sharing its rows across every tenant, while the gate
+shows green. Close that hole by registering every such table so the gate
+actually covers it:
+
+.. code-block:: python
+
+    # settings.py -- raw tables that must be RLS-protected but cannot subclass
+    # TenantRLSModel (contrib auth/sessions, DRF authtoken, M2M through-tables).
+    TENANT_RLS_EXTERNAL_TABLES = (
+        "authtoken_token",
+        "myapp_project_collaborators",   # an M2M through-table
+        # ... one entry per externally-isolated table ...
+    )
+
+With those registered, ``manage.py verify_rls`` asserts RLS/FORCE/a policy on
+each external table too (and ``verify_rls --table <name>`` checks an ad-hoc one),
+so CI fails on an unpoliced registered table instead of passing blind. See the
+:ref:`third-party packages section <rls-migration-third-party>` for the DDL that
+isolates these tables, and Options B/C above for the mechanism that applies it.
+
 .. _rls-migration-null-safeguards:
 
 NULL-row safeguards (and why they are not a substitute for backfilling)
@@ -2378,6 +2512,59 @@ tenant:
 See :ref:`bypass-leak-note` for how bypass state interacts with tenant
 (re)activation inside these blocks.
 
+.. _rls-migration-inprocess-background:
+
+In-process background work (ThreadPoolExecutor / signal dispatch)
+-----------------------------------------------------------------
+
+Not every out-of-request path is a Celery task. ``ThreadPoolExecutor``,
+``loop.run_in_executor``, ``asyncio.to_thread``, a raw ``threading.Thread``, and
+synchronous **signal dispatch** all run code that never went through
+``TenantMainMiddleware`` -- so the worker starts at the empty-sentinel GUC and
+sees zero rows. Database connections are **thread-local**, so a worker thread
+gets a *fresh* connection with no tenant; the request's tenant does **not**
+follow it. The canonical shape:
+
+#. **Snapshot the tenant pk on the submitting thread**, while the request tenant
+   is still active, with ``require_current_tenant()`` so a missing tenant fails
+   loudly *now* rather than silently producing zero-row work later.
+#. **Pass that pk into the worker** (a plain argument / closure capture -- not the
+   tenant object, and never the live connection).
+#. **Wrap ALL of the worker's ORM access in** ``rls_context(tid)``.
+
+.. code-block:: python
+
+    from concurrent.futures import ThreadPoolExecutor
+    from django_tenants.rls.session import require_current_tenant, rls_context
+
+    def submit_reindex(executor: ThreadPoolExecutor):
+        # On the SUBMITTING thread, while the request tenant is active:
+        tid = require_current_tenant()        # raises NoActiveTenant if unset
+        executor.submit(_reindex_worker, tid)
+
+    def _reindex_worker(tid):
+        # Fresh thread-local connection, no tenant: wrap EVERYTHING in rls_context.
+        with rls_context(tid):
+            for note in Note.objects.all():   # scoped to this tenant
+                rebuild(note)
+
+.. warning::
+
+   **Wrap the whole worker body, not part of it.** A common bug is opening
+   ``rls_context(tid)`` around the write but leaving an earlier lookup (or a
+   ``.get()`` that builds the work list) *outside* it -- that lookup runs at the
+   empty sentinel and returns zero rows, so the worker silently does nothing. If
+   any ORM access in the worker is not inside the ``rls_context``, it is wrong.
+
+Unlike Celery, raw threads and signal handlers have **no** ``task_prerun`` /
+``task_postrun`` equivalent: nothing establishes a tenant for them and nothing
+auto-resets the connection afterwards. The worker therefore owns its own context
+end to end. Snapshotting with ``require_current_tenant()`` at the boundary is
+what turns a forgotten snapshot into a loud ``NoActiveTenant`` instead of a
+silent zero-row run. The Celery counterpart that does wire up automatic
+pre/post handlers is ``django_tenants.rls.celery.register()`` (above); for raw
+in-process work you are the one wiring the boundary.
+
 Admin, cross-tenant aggregation, data migrations: ``bypass_rls()``
 ------------------------------------------------------------------
 
@@ -2588,6 +2775,14 @@ When converting an app to RLS, grep for and review each of these patterns:
    * - Admin / cross-tenant reports / data migrations
      - Wrap the narrowest possible block in ``bypass_rls()``, opened **after**
        any tenant activation.
+   * - Test that creates a converted model
+     - Now needs a tenant: set ``tenant=`` explicitly or create inside
+       ``rls_context(tenant)``. With RLS off (SQLite) the auto-stamp does **not**
+       fire, so a fixture/factory that omits the tenant fails.
+   * - ``mock.patch("...schema_context"/"...tenant_context")`` by string
+     - Re-point at the new ``rls_context`` / ``tenant_context`` call site, or the
+       patch silently no-ops once conversion moves the call site and the test
+       asserts nothing.
 
 API quick reference
 -------------------
@@ -2805,6 +3000,70 @@ If ``recomputed`` is *less* than ``total``, some rows have a ``tenant_id`` that
 matches no active tenant -- typically rows still carrying ``NULL`` (which never
 matches, see :ref:`rls-null-rows`) or a stale tenant id. Those rows are
 invisible to every tenant and must be repaired before you trust isolation.
+
+Validate isolation for out-of-request code paths
+-------------------------------------------------
+
+The tests above prove the **policy on a model**. They do **not** prove that your
+*non-request* code paths -- a management command, a signal subscriber, a
+background worker -- actually establish a tenant before they touch that model.
+That is a separate failure: the policy can be perfect while a command runs at the
+empty-sentinel GUC and silently reads/writes zero rows (failure class 3, see
+:ref:`rls-migration-third-party`). Test the **callable**, not just the model.
+
+The same ``RLSIsolationTestCaseMixin`` (see
+:ref:`the CI section <rls-migration-testing-ci>`) carries three callable-level
+helpers for exactly this:
+
+* ``assertRequiresTenant(func, ...)`` -- invokes ``func`` with **no** active
+  tenant and asserts it fails *closed* (raises ``NoActiveTenant`` from a
+  ``require_current_tenant()`` guard, or otherwise performs no visible work). A
+  command that quietly does nothing is the bug this catches.
+* ``as_tenant(tenant)`` -- runs a block under a real tenant so you can assert it
+  touched only that tenant's rows.
+* ``assertNoLeakAfter(func, ...)`` -- runs ``func`` and then asserts the
+  connection returned to the secure default (no tenant set, bypass off), so a
+  callable that strands an ``rls_context`` / ``bypass_rls`` on a reused
+  connection is caught.
+
+.. code-block:: python
+
+   from django.core.management import call_command
+   from django.test import TransactionTestCase
+   from django_tenants.rls.test import RLSIsolationTestCaseMixin
+
+   from myapp.models import Note
+
+
+   class ImportNotesCommandTests(RLSIsolationTestCaseMixin, TransactionTestCase):
+       rls_model = Note
+
+       def test_command_fails_closed_without_a_tenant(self):
+           # 1. No active tenant -> the command must refuse, not silently no-op.
+           self.assertRequiresTenant(call_command, "import_notes", source="a.csv")
+
+       def test_command_touches_only_the_active_tenant(self):
+           # 2. Under tenant A, only A's rows are created/visible.
+           with self.as_tenant(self.tenant_a):
+               call_command("import_notes", source="a.csv")
+               self.assertTrue(Note.objects.exists())
+           with self.as_tenant(self.tenant_b):
+               self.assertFalse(Note.objects.exists())   # nothing leaked to B
+
+       def test_command_leaves_the_connection_secure(self):
+           # 3. After it returns, the connection is back at the secure default
+           #    (no stranded rls_context / bypass_rls on a reused connection).
+           self.assertNoLeakAfter(
+               call_command, "import_notes", source="a.csv",
+           )
+
+The same shape applies to a signal subscriber or a thread-pool worker: drive it
+through ``assertRequiresTenant`` / ``as_tenant`` / ``assertNoLeakAfter`` instead
+of ``call_command``. Build the guard into the callable itself with
+``require_current_tenant()`` at its boundary (see
+:ref:`rls-migration-inprocess-background`) so ``assertRequiresTenant`` has a loud
+failure to observe; for the Channels/ASGI counterpart see
+:ref:`the per-package notes <rls-migration-third-party>`.
 
 Reconcile against the originating schemas before decommission
 -------------------------------------------------------------
@@ -3630,6 +3889,8 @@ pre-existing cross-tenant collision; prefix it with the tenant. ``django-admin-c
 stashes in-flight confirmation state in the shared cache with no tenant component;
 it is fixed automatically once your cache ``KEY_FUNCTION`` is tenant-aware (above).
 
+.. _rls-migration-adopter-checklist:
+
 Adopter checklist (grep your own codebase)
 ------------------------------------------
 
@@ -3654,6 +3915,17 @@ Every item above depends on *your* settings and code. Concretely:
    grep -rn "call_command\|database_sync_to_async\|@shared_task\|@app.task\|post_save\|pre_save" <app>
    grep -rnE "ThreadPoolExecutor|run_in_executor|asyncio.to_thread|\.submit\(|threading.Thread" <app>
    grep -rn "schema_context\|optional_schema_context" <app>   # string-based -> degrades to zero rows under RLS
+
+   # Already-AUTHORED migration files: an unsafe auto-generated tenant-FK AddField
+   # (makemigrations on an empty DB emits default=1, preserve_default=False, which
+   # stamps every existing prod row into one tenant -- rewrite as the staged
+   # null=True add -> backfill -> SET NOT NULL shape; see rls-migration-staged-order):
+   grep -rn "preserve_default=False" <app>/migrations/
+
+   # Test fixtures / test doubles that conversion silently breaks (see the
+   # "existing test suite after conversion" section): stale string patch targets
+   # no-op once call sites move to rls_context/tenant_context.
+   grep -rnE "patch\(.*schema_context|patch\(.*tenant_context|patch\(.*set_tenant" <tests>
 
    # Confirm the runtime role cannot bypass RLS (W001/W003 are DEPLOY checks):
    python manage.py check --deploy --database default         # W001/W003 must NOT fire
@@ -3772,6 +4044,53 @@ unique within a schema is no longer unique within the shared table.
    ``UniqueConstraint(fields=["tenant", ...])`` (so the DB enforces it and W005
    can see it) or run the lookup under ``bypass_rls()`` if a global check is
    genuinely intended.
+
+.. _rls-migration-w005-triage:
+
+Triaging W005 / accepted-residual UNIQUE constraints
+----------------------------------------------------
+
+Once your unique constraints are tenant-scoped, ``W005`` will still fire for any
+remaining UNIQUE that omits the tenant column. Not every one is a bug you must
+fix: ``W005`` flags **every** tenant-omitting UNIQUE identically, but the covert
+channel it warns about only has teeth when an attacker can **guess or enumerate**
+the unique value to probe for a collision across tenants (PostgreSQL checks
+UNIQUE with RLS bypassed, so a global UNIQUE leaks "this value already exists
+*somewhere*"). Use this decision rule per constraint:
+
+* **FIX (tenant-scope it)** when the unique value is low-entropy, client-supplied,
+  or otherwise enumerable -- emails, usernames, slugs, integer / ``BigAutoField``
+  FKs, externally-chosen ids, sequential numbers. These are guessable, so the
+  existence-probe channel is real; replace the global UNIQUE with
+  ``UniqueConstraint(fields=["tenant", ...])`` (or, for a table you do not own,
+  swap it in raw SQL as in the :ref:`third-party recipe <rls-migration-third-party>`).
+* **ACCEPTED RESIDUAL (document it)** when the value is high-entropy and
+  **not** enumerable **and** global uniqueness is genuinely acceptable -- a
+  ``OneToOneField`` whose target's PK is a random ``uuid4()``, or a
+  ``UUIDField(unique=True)`` populated with ``uuid4()``. An attacker cannot
+  practically enumerate a random 122-bit UUID, so the probe channel is
+  impractical.
+
+.. warning::
+
+   **A global UNIQUE has a SECOND consequence beyond the covert channel.** It
+   also makes the relationship **globally one-per-value**: e.g. a global
+   ``UNIQUE(user_id)`` means one user can own exactly **one** token *across all
+   tenants*, not one per tenant. Accept a UUID-backed residual only if that
+   global-one-per-value semantics is *also* what you want; if a value must be
+   unique *within* a tenant but repeatable across tenants, you must tenant-scope
+   it regardless of entropy.
+
+To keep ``check --deploy`` / CI / ``rls_doctor`` green on a constraint you have
+deliberately accepted, do **not** reach for a blanket
+``SILENCED_SYSTEM_CHECKS = ["django_tenants_rls.W005"]`` -- that silences W005 for
+**every** model and hides the next, genuinely-enumerable, omission someone adds
+later. Prefer a **per-model justification**: record the decision in code review
+(a comment on the model naming the field, the entropy argument, and the
+accepted global-one-per-value semantics) plus a one-line residual log, so each
+accepted finding is auditable on its own rather than swept under a project-wide
+silence. The entropy-aware ``W005`` message annotates these UUID-backed cases for
+you so they are distinguishable from the enumerable ones in the check output.
 
 .. _rls-migration-poolers:
 
@@ -4018,6 +4337,55 @@ a role that **cannot** bypass RLS.
    the :ref:`W003 check <rls-system-checks>` enforces at startup (see
    :ref:`rls-database-role`).
 
+Your existing (non-RLS) test suite after conversion
+---------------------------------------------------
+
+Before you add the new Postgres-backed isolation job below, expect conversion to
+**break your pre-existing ordinary suite** -- the one that runs on SQLite with
+RLS disabled. The breakages are not isolation failures; they are mechanical
+fallout from every converted model now carrying a ``tenant`` FK, and they will
+turn a previously-green suite red in three distinct ways.
+
+#. **Fixtures/factories now need a tenant.** Every converted model has a
+   ``NOT NULL`` ``tenant`` FK, so any fixture, factory, or test that builds one
+   without a tenant fails -- an ``IntegrityError`` on save, or a
+   ``ValidationError`` from ``full_clean()``. Critically, with RLS *disabled* on
+   SQLite the ``save()`` auto-stamp does **not** run (there is no active tenant
+   GUC to stamp from), so you must pass ``tenant=`` explicitly or wrap creation
+   in ``rls_context(tenant)``:
+
+   .. code-block:: python
+
+       # Was: Note.objects.create(text="hi")    # now raises -- no tenant
+       Note.objects.create(text="hi", tenant=self.tenant)        # explicit
+       # ...or, if you rely on the auto-stamp (only fires when RLS is enabled):
+       with rls_context(self.tenant):
+           Note.objects.create(text="hi")
+
+   Wire a default-tenant fixture into your test settings so existing factories
+   keep working. See :ref:`rls-migration-no-autostamp` for why the auto-stamp is
+   silent here.
+
+#. **String-target test doubles go stale.** A mock written as
+   ``mock.patch("myapp.mod.schema_context")`` silently no-ops once conversion
+   moves that call site from ``schema_context`` to ``rls_context`` /
+   ``tenant_context`` -- the patched name is no longer the one the code calls, so
+   the patch attaches to nothing and the test asserts nothing while still passing.
+   Re-point every string patch target at the new call site (or assert on
+   ``rls_context``). The audit grep for these is in the
+   :ref:`adopter checklist <rls-migration-adopter-checklist>`.
+
+#. **The two CI modes exercise different states.** ``pytest --no-migrations``
+   builds the schema with ``run_syncdb`` from the *current* model state, while
+   ``manage.py test`` applies your migration *history*. After a staged tenant-FK
+   conversion these can disagree (e.g. a column that history adds nullable then
+   tightens, versus one syncdb creates ``NOT NULL`` outright). Run **both** in CI
+   and reconcile any difference rather than trusting whichever one is green.
+
+These are independent of the Postgres isolation job: fix them on your existing
+SQLite/RLS-disabled suite first, then add the RLS job below. Cross-link
+``verify_rls`` as the gate that proves the *enabled* path.
+
 Postgres-backed test settings (RLS on, non-bypassing role)
 ----------------------------------------------------------
 
@@ -4070,55 +4438,44 @@ postgres`` step, a docker-compose service, etc.) before the test run:
 A two-tenant isolation test
 ---------------------------
 
-The library ships a reusable helper that performs the dangerous setup for you --
-it provisions (or reuses) a ``NOSUPERUSER NOBYPASSRLS`` role, points the
-connection at it for the duration of the test, and restores the original
-credentials in teardown -- so your test body is just the assertions. Use it as
-the base class for a two-tenant check:
+The library ships a reusable mixin,
+``django_tenants.rls.test.RLSIsolationTestCaseMixin``, that performs the
+dangerous setup for you -- it creates the model's table and policy plus two
+scoping tenants (``self.tenant_a`` / ``self.tenant_b``), provisions (or reuses) a
+``NOSUPERUSER NOBYPASSRLS`` role, points the connection at it for the duration of
+the test, and restores the original credentials in teardown -- so your test body
+is just the assertions. Combine it with Django's ``TransactionTestCase`` and
+point ``rls_model`` at any ``TenantRLSModel`` subclass:
 
 .. code-block:: python
 
-   from django_tenants.rls.session import rls_context, bypass_rls
-   from django_tenants.rls.test import RLSIsolationTestCase  # reusable helper
-   from myapp.models import Note
+   from django.test import TransactionTestCase
+   from django_tenants.rls.test import RLSIsolationTestCaseMixin
+
+   from myapp.models import Note   # a TenantRLSModel subclass
 
 
-   class TwoTenantIsolationTests(RLSIsolationTestCase):
+   class TwoTenantIsolationTests(RLSIsolationTestCaseMixin, TransactionTestCase):
        """Asserts the secure-by-default semantics end to end, as the app role."""
 
+       rls_model = Note
+
        def test_each_tenant_sees_only_its_own_rows(self):
-           tenant_a, tenant_b = self.make_tenants(2)   # helper creates Tenants
+           # The mixin created self.tenant_a / self.tenant_b in setUpClass; it
+           # also built the model's table + policy and switched the connection to
+           # a NOSUPERUSER NOBYPASSRLS role for the duration of the test.
+           self.assertIsolated(
+               self.rls_model, self.tenant_a, self.tenant_b,
+               make_row=lambda tenant: {"text": "hi"},
+           )
 
-           with rls_context(tenant_a):
-               Note.objects.create(text="a-only")
-           with rls_context(tenant_b):
-               Note.objects.create(text="b-only")
+       def test_no_tenant_sees_nothing(self):
+           # Secure by default: with no active tenant, zero rows are visible.
+           self.assertInvisibleWithoutTenant(
+               self.rls_model, make_row=lambda tenant: {"text": "secret"},
+           )
 
-           # Cross-tenant isolation: A cannot see B's row and vice versa.
-           with rls_context(tenant_a):
-               a_texts = set(Note.objects.values_list("text", flat=True))
-           with rls_context(tenant_b):
-               b_texts = set(Note.objects.values_list("text", flat=True))
-           self.assertEqual(a_texts, {"a-only"})
-           self.assertEqual(b_texts, {"b-only"})
-
-           # Secure by default: no active tenant => zero rows.
-           self.assertEqual(Note.objects.count(), 0)
-
-           # Bypass reconciles: the global count equals the sum of both tenants'.
-           with bypass_rls():
-               self.assertEqual(Note.objects.count(), 2)
-
-       def test_with_check_rejects_wrong_tenant_write(self):
-           from django.db import DatabaseError
-
-           tenant_a, tenant_b = self.make_tenants(2)
-           with self.assertRaises(DatabaseError):
-               with rls_context(tenant_a):
-                   # Explicit wrong tenant -> WITH CHECK must reject at the DB.
-                   Note.objects.create(text="leak", tenant=tenant_b)
-
-The helper **skips itself** (rather than failing) when no Postgres is configured
+The mixin **skips itself** (rather than failing) when no Postgres is configured
 on the tenant alias or RLS is disabled, so the same test file is harmless in the
 default SQLite suite and only runs for real in the Postgres-backed RLS job. This
 mirrors the library's own end-to-end isolation test.
