@@ -1,0 +1,195 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% comment %}
+Read-only RLS readiness dashboard. Rendered by
+django_tenants.rls.admin.rls_readiness_view. This page DISPLAYS the result of
+doctor.scan() plus copy-paste manage.py commands; it deliberately contains NO
+<form>, no apply/fix button, and no POST target. The application DB role is
+NOSUPERUSER NOBYPASSRLS and must never run RLS DDL from a web request.
+{% endcomment %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  .rls-summary { margin: 1em 0; }
+  .rls-summary .rls-chip { display: inline-block; padding: 6px 12px; margin: 0 6px 6px 0;
+    border-radius: 4px; font-weight: 600; }
+  .rls-chip-done { background: #dff0d8; color: #2b542c; }
+  .rls-chip-auto_fixable { background: #d9edf7; color: #245269; }
+  .rls-chip-generate_migration { background: #fcf8e3; color: #66512c; }
+  .rls-chip-manual { background: #fde6d8; color: #7a3b12; }
+  .rls-chip-blocked { background: #f2dede; color: #843534; }
+  .rls-badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; }
+  .rls-badge.done { background: #dff0d8; color: #2b542c; }
+  .rls-badge.auto_fixable { background: #d9edf7; color: #245269; }
+  .rls-badge.generate_migration { background: #fcf8e3; color: #66512c; }
+  .rls-badge.manual { background: #fde6d8; color: #7a3b12; }
+  .rls-badge.blocked { background: #f2dede; color: #843534; }
+  .rls-level-ok { color: #2b542c; }
+  .rls-level-warning { color: #8a6d3b; }
+  .rls-level-error { color: #a94442; font-weight: 600; }
+  .rls-blocked-banner { background: #f2dede; border: 1px solid #ebccd1; color: #843534;
+    padding: 12px 16px; border-radius: 4px; margin: 1em 0; }
+  .rls-note { background: #f7f7f7; border-left: 4px solid #79aec8; padding: 8px 12px;
+    margin: 1em 0; }
+  table.rls-table { width: 100%; }
+  table.rls-table th { text-align: left; }
+  pre.rls-cmd { background: #2b2b2b; color: #f0f0f0; padding: 8px 12px; border-radius: 4px;
+    overflow-x: auto; margin: 4px 0 12px 0; }
+  ul.rls-problems { margin: 0; padding-left: 1.2em; }
+</style>
+{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">{% trans 'Home' %}</a>
+  &rsaquo; {% trans 'RLS readiness' %}
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+
+  <div class="rls-note">
+    {% blocktrans %}This dashboard is <strong>read-only</strong>. It scans your project and database
+    and shows what is needed to adopt shared-schema row-level security. It never applies
+    migrations, never enables RLS, and has no &ldquo;fix&rdquo; button: the application database role
+    is intentionally unprivileged. Run the displayed commands yourself.{% endblocktrans %}
+  </div>
+
+  {% if scan_error %}
+    <p class="errornote">{% blocktrans %}The readiness scan could not complete: {{ scan_error }}{% endblocktrans %}</p>
+  {% endif %}
+
+  {% if report %}
+
+    {% if report.blocked %}
+      <div class="rls-blocked-banner">
+        <strong>{% trans 'Enforcement is blocked.' %}</strong>
+        {% blocktrans %}The connecting database role bypasses row-level security (superuser or
+        BYPASSRLS), so any policies that exist are not actually enforced. Fix the role
+        (use a NOSUPERUSER NOBYPASSRLS application role) before relying on RLS. Until then,
+        <code>rls_doctor --fix</code> will refuse to run.{% endblocktrans %}
+      </div>
+    {% endif %}
+
+    <p>
+      {% blocktrans with db=report.database %}Database alias: <code>{{ db }}</code>.{% endblocktrans %}
+      {% if report.rls_enabled %}
+        {% trans 'TENANT_RLS_ENABLED is on.' %}
+      {% else %}
+        {% trans 'TENANT_RLS_ENABLED is off (scanning anyway).' %}
+      {% endif %}
+    </p>
+
+    <h2>{% trans 'Summary' %}</h2>
+    <div class="rls-summary">
+      <span class="rls-chip rls-chip-done">{% trans 'Done' %}: {{ report.summary.done }}</span>
+      <span class="rls-chip rls-chip-auto_fixable">{% trans 'Auto-fixable' %}: {{ report.summary.auto_fixable }}</span>
+      <span class="rls-chip rls-chip-generate_migration">{% trans 'Needs migration' %}: {{ report.summary.generate_migration }}</span>
+      <span class="rls-chip rls-chip-manual">{% trans 'Manual' %}: {{ report.summary.manual }}</span>
+      <span class="rls-chip rls-chip-blocked">{% trans 'Blocked' %}: {{ report.summary.blocked }}</span>
+    </div>
+
+    <h2>{% trans 'Models' %}</h2>
+    {% if report.models %}
+      <table class="rls-table">
+        <thead>
+          <tr>
+            <th>{% trans 'Model' %}</th>
+            <th>{% trans 'Table' %}</th>
+            <th>{% trans 'Status' %}</th>
+            <th>{% trans 'Unscoped rows' %}</th>
+            <th>{% trans 'Problems' %}</th>
+            <th>{% trans 'Remedy' %}</th>
+            <th>{% trans 'Step' %}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for m in report.models %}
+            <tr>
+              <td><code>{{ m.label }}</code></td>
+              <td><code>{{ m.table }}</code></td>
+              <td><span class="rls-badge {{ m.classification }}">{{ m.classification }}</span></td>
+              <td>
+                {% if m.unscoped_rows is None %}
+                  {% trans 'unknown' %}
+                {% elif m.unscoped_rows %}
+                  {% trans 'yes' %}
+                {% else %}
+                  {% trans 'no' %}
+                {% endif %}
+              </td>
+              <td>
+                {% if m.problems %}
+                  <ul class="rls-problems">
+                    {% for p in m.problems %}<li>{{ p }}</li>{% endfor %}
+                  </ul>
+                {% else %}
+                  &mdash;
+                {% endif %}
+              </td>
+              <td>{{ m.remedy }}</td>
+              <td>
+                {% if m.step %}
+                  <a href="{{ docs_step_url }}" target="_blank" rel="noopener">{% blocktrans with n=m.step %}Step {{ n }}{% endblocktrans %}</a>
+                {% else %}&mdash;{% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p>{% trans 'No concrete TenantRLSModel subclasses were found.' %}</p>
+    {% endif %}
+
+    <h2>{% trans 'Settings findings' %}</h2>
+    {% if report.settings %}
+      <table class="rls-table">
+        <thead>
+          <tr>
+            <th>{% trans 'Check' %}</th>
+            <th>{% trans 'Level' %}</th>
+            <th>{% trans 'Finding' %}</th>
+            <th>{% trans 'Remedy' %}</th>
+            <th>{% trans 'Step' %}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in report.settings %}
+            <tr>
+              <td><code>{{ s.id }}</code><br>{{ s.title }}</td>
+              <td class="rls-level-{{ s.level }}">{{ s.level }}</td>
+              <td>{{ s.detail }}</td>
+              <td>{{ s.remedy }}</td>
+              <td>
+                {% if s.step %}
+                  <a href="{{ docs_step_url }}" target="_blank" rel="noopener">{% blocktrans with n=s.step %}Step {{ n }}{% endblocktrans %}</a>
+                {% else %}&mdash;{% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p>{% trans 'No settings findings.' %}</p>
+    {% endif %}
+
+    <h2>{% trans 'Commands to run' %}</h2>
+    <p>{% blocktrans %}Run these yourself from a shell with appropriately privileged
+    credentials. This page does not run them for you.{% endblocktrans %}</p>
+    {% for label, cmd in commands %}
+      <p><strong>{{ label }}</strong></p>
+      <pre class="rls-cmd">{{ cmd }}</pre>
+    {% endfor %}
+
+    <h2>{% trans 'Documentation' %}</h2>
+    <ul>
+      <li><a href="{{ docs_assistant_url }}" target="_blank" rel="noopener">{% trans 'Migration assistant (rls_doctor)' %}</a></li>
+      <li><a href="{{ docs_step_url }}" target="_blank" rel="noopener">{% trans 'RLS migration steps' %}</a></li>
+    </ul>
+
+  {% endif %}
+
+</div>
+{% endblock %}
