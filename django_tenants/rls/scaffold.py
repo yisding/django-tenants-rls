@@ -37,20 +37,19 @@ All Django imports are lazy (inside the functions) so importing this module stay
 cheap and free of app-registry side effects, matching the rest of this package.
 """
 
+# ``_quote_ident`` lives in operations.py (its canonical home -- the reversible
+# migration operations that emit the same DDL use it too). Import it here so the
+# raw third-party / external-table DDL these generators interpolate stays quoted
+# identically, without duplicating the Postgres double-quote-doubling rule.
+# operations.py does not import scaffold, so this introduces no import cycle, and
+# the helper has no app-registry side effects, so importing it at module level
+# keeps this module cheap to import.
+from .operations import _quote_ident
+
 
 # Marker the assistant/docs/tests look for: backfill is Step 4, app-specific and
 # DANGEROUS, so the generated RunPython is always a commented-out STUB.
 _BACKFILL_TODO = "TODO(step-4): backfill"
-
-
-def _quote_ident(name):
-    """Quote a SQL identifier, doubling any embedded double-quote (Postgres rule).
-
-    Used for the raw third-party DDL where a table / policy name is interpolated
-    directly into SQL text. A name containing a ``"`` would otherwise break out of
-    the identifier; doubling it keeps the identifier safe and well-formed.
-    """
-    return '"' + str(name).replace('"', '""') + '"'
 
 
 def _model_idents(model):
@@ -335,7 +334,6 @@ CREATE POLICY {q_policy} ON {q_table}
         q_table=q_table,
         field=field,
         pk_cast=pk_cast,
-        policy_name=policy_name,
         q_policy=q_policy,
         using=using,
         check=check,
@@ -778,7 +776,6 @@ class Migration(migrations.Migration):
         label=label,
         app_label=app_label,
         model_name=model_name,
-        db_table=db_table,
         fields=tuple(field_list),
         scoped=tuple(scoped),
         scoped_repr=scoped_repr,

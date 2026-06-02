@@ -59,6 +59,22 @@ policies are created (and torn down) for you, and two tenant rows of your
             with self.as_tenant(self.tenant_b):
                 self.assertEqual(self.rls_model.objects.count(), 0)
 
+For out-of-request code paths (management commands, signal subscribers,
+thread-pool/ASGI workers) the model-level helpers above only prove the policy on
+a *model*, not that the callable establishes its own context. Two callable-level
+helpers cover that::
+
+    def test_command_requires_a_tenant(self):
+        # With no active tenant the entrypoint must fail closed: either raise
+        # or perform no visible work (zero rows touched).
+        self.assertRequiresTenant(call_command, "sync_notes")
+
+    def test_command_leaves_no_leak(self):
+        # After the callable returns, the connection must be back at the secure
+        # default (no active tenant, bypass off) -- catches a callable that
+        # strands an rls_context()/bypass_rls() on the reused connection.
+        self.assertNoLeakAfter(call_command, "sync_notes")
+
 The mixin works for any tenant PK type (integer / bigint / uuid / text) and any
 ``TENANT_MODEL`` -- it only relies on the public ``rls_context`` / ``bypass_rls``
 session helpers and on the model's ``enable_rls()`` classmethod.
@@ -107,6 +123,10 @@ class RLSIsolationTestCaseMixin:
     * :meth:`assertIsolated` -- assert two tenants cannot see each other's rows.
     * :meth:`assertInvisibleWithoutTenant` -- assert no rows are visible with no
       active tenant (secure by default).
+    * :meth:`assertRequiresTenant` -- assert a callable fails closed when no
+      tenant is active (raises, or performs no visible work).
+    * :meth:`assertNoLeakAfter` -- assert a callable leaves the connection at the
+      secure default (no active tenant, bypass off) when it returns.
     """
 
     #: The ``TenantRLSModel`` subclass under test. Required.
@@ -419,4 +439,78 @@ class RLSIsolationTestCaseMixin:
             model.objects.count(),
             0,
             "no rows must be visible with no active tenant (secure by default)",
+        )
+
+    def assertRequiresTenant(self, func, *args, exc=Exception, **kwargs):
+        """Assert ``func`` fails closed when no tenant is active.
+
+        Calls ``func(*args, **kwargs)`` with the active tenant cleared on the
+        mixin's connection and asserts the secure-by-default contract for an
+        out-of-request entrypoint: it must either raise ``exc`` (e.g.
+        :class:`~django_tenants.rls.session.NoActiveTenant` when it guards with
+        ``require_current_tenant()``) **or** perform no visible work -- if it
+        returns normally it must not have touched any of the mixin's
+        :attr:`rls_model` rows, since RLS would otherwise let it operate against
+        zero rows silently.
+
+        ``exc`` may be narrowed to a specific exception type to require that the
+        callable raises rather than merely no-ops.
+        """
+        from django_tenants.rls.session import bypass_rls, clear_current_tenant
+
+        clear_current_tenant(connection=self._connection)
+
+        # Snapshot the row count under bypass so the comparison is not itself
+        # filtered by the (now empty) active-tenant policy.
+        with bypass_rls(using=self._connection.alias):
+            before = self.rls_model.objects.count()
+
+        try:
+            func(*args, **kwargs)
+        except exc:
+            return
+        except Exception:
+            # A different exception is still a "fails closed" outcome; surface
+            # it so the caller can see what actually went wrong.
+            raise
+
+        with bypass_rls(using=self._connection.alias):
+            after = self.rls_model.objects.count()
+        self.assertEqual(
+            after,
+            before,
+            "callable did not raise %s and yet changed visible rows with no "
+            "active tenant (must fail closed: raise or do nothing)"
+            % getattr(exc, "__name__", exc),
+        )
+
+    def assertNoLeakAfter(self, func, *args, **kwargs):
+        """Assert ``func`` leaves the connection at the secure default.
+
+        Clears the active tenant, calls ``func(*args, **kwargs)``, then asserts
+        that on the mixin's connection there is no active tenant
+        (``get_current_tenant_id(...) is None``) and bypass is off
+        (``get_bypass(...) is False``). This catches a callable that opens an
+        ``rls_context``/``bypass_rls`` and strands it on the reused connection,
+        which would silently widen the visibility of unrelated later code.
+        """
+        from django_tenants.rls.session import (
+            clear_current_tenant,
+            get_bypass,
+            get_current_tenant_id,
+        )
+
+        clear_current_tenant(connection=self._connection)
+
+        func(*args, **kwargs)
+
+        self.assertIsNone(
+            get_current_tenant_id(connection=self._connection),
+            "callable left an active tenant stranded on the connection "
+            "(expected the secure no-tenant default after it returned)",
+        )
+        self.assertFalse(
+            get_bypass(connection=self._connection),
+            "callable left RLS bypass enabled on the connection "
+            "(expected bypass off after it returned)",
         )

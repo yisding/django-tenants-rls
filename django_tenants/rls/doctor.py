@@ -107,17 +107,28 @@ def _unique_problems(model):
     Composes :func:`checks._unique_fieldsets` (the same enumeration W005 uses) so
     the doctor's "UNIQUE omits the tenant" finding is byte-for-byte the same set
     the system check would flag. Pure model introspection -- no DB access.
+
+    Mirrors the W005 entropy-aware annotation: when the offending UNIQUE is a
+    single high-entropy, non-enumerable value (a OneToOne to a random-UUID PK, or
+    a ``UUIDField(unique=True)``) the finding is NOT dropped -- the global
+    one-per-value semantics still change -- but the same residual note the W005
+    check appends (:data:`checks._W005_UUID_RESIDUAL_NOTE`, via
+    :func:`checks._is_high_entropy_uuid_unique`) is appended here too, so the
+    doctor output stays byte-aligned with the system check.
     """
     field = conf.tenant_field()
     problems = []
     for label, fields in checks._unique_fieldsets(model):
         if field in fields:
             continue
-        problems.append(
+        problem = (
             "UNIQUE constraint %s spans %r and omits the tenant field %r "
             "(checked with RLS BYPASSED -> cross-tenant uniqueness/leak)"
             % (label, tuple(fields), field)
         )
+        if checks._is_high_entropy_uuid_unique(model, fields):
+            problem += checks._W005_UUID_RESIDUAL_NOTE
+        problems.append(problem)
     return problems
 
 
@@ -178,6 +189,73 @@ def _has_unscoped_rows(model, connection):
         return bool(row and row[0])
     except Exception:
         return False
+
+
+# The classification strings for a registered external table. A subset of the
+# model :data:`CLASSIFICATIONS`: an external table is either fully isolated
+# (``done``), owed isolation DDL (``needs_isolation``), or unprovable because the
+# connecting role bypasses RLS (``blocked``). It is intentionally narrower than
+# the model enum -- the doctor cannot scaffold a per-app migration for a raw table
+# (that is ``isolate_external_table_sql`` / ``IsolateExternalTable``), so it never
+# emits ``auto_fixable`` / ``generate_migration`` / ``manual`` for one.
+EXTERNAL_TABLE_CLASSIFICATIONS = (
+    "done",
+    "needs_isolation",
+    "blocked",
+)
+
+
+def classify_external_table(table, connection, *, force):
+    """Classify a single registered external table against the live database.
+
+    Returns ``(classification, problems)`` where ``classification`` is one of
+    :data:`EXTERNAL_TABLE_CLASSIFICATIONS` and ``problems`` is a list of
+    human-readable strings (empty for ``"done"``). External/contrib/M2M tables
+    cannot subclass :class:`TenantRLSModel`, so the model-only introspection in
+    :func:`classify_model` never sees them; this runs the SAME table-name catalog
+    introspection ``verify_rls`` and the W008 check use
+    (:func:`checks.rls_live_problems_for_table`) so a table registered in
+    ``TENANT_RLS_EXTERNAL_TABLES`` is judged by exactly the same RLS-live bar as a
+    first-party model table.
+
+    Decision order mirrors :func:`classify_model`:
+
+    1. ``blocked`` -- the connecting role bypasses RLS (W003): enforcement is
+       theatre, so nothing below it can be proven. Surfaced loudly; ``--fix`` must
+       refuse.
+    2. ``done`` -- :func:`checks.rls_live_problems_for_table` is empty: RLS is
+       enabled (and forced when ``force``), a policy exists and the tenant column
+       is NOT NULL.
+    3. ``needs_isolation`` -- any live problem (RLS off / unforced / no policy /
+       nullable tenant column), or a database error introspecting the table. The
+       fix is the external-table isolation DDL (``isolate_external_table_sql`` /
+       :class:`~django_tenants.rls.operations.IsolateExternalTable`), not an
+       auto-run enable, so it is never ``auto_fixable``.
+
+    BEST-EFFORT: a database error introspecting the table degrades to a single
+    ``needs_isolation`` finding describing the failure rather than raising, so a
+    missing table or unreachable DB never aborts the whole scan.
+    """
+    if _role_bypasses_rls(connection):
+        return "blocked", [
+            "the connecting role bypasses RLS (superuser or BYPASSRLS); "
+            "isolation of external table %r is NOT enforced for this connection "
+            "(W003)" % table
+        ]
+
+    try:
+        live_problems = checks.rls_live_problems_for_table(
+            table, connection, force=force
+        )
+    except Exception as exc:
+        return "needs_isolation", [
+            "could not introspect RLS state on external table %r: %s"
+            % (table, exc)
+        ]
+
+    if not live_problems:
+        return "done", []
+    return "needs_isolation", list(live_problems)
 
 
 def classify_model(model, connection, *, force):
@@ -529,6 +607,117 @@ def _settings_findings(connection):
     return findings
 
 
+def unsafe_tenant_fk_migration_findings(connection=None):
+    """Best-effort static scan for an unsafe, UNAPPLIED tenant-FK ``AddField``.
+
+    Every other doctor introspection (``classify_model`` and its helpers) is
+    live-DB only -- by construction it cannot see a migration that has not run
+    yet. The classic G1 landmine is exactly that: running ``makemigrations`` after
+    adding the tenant FK against an EMPTY (CI / throwaway) database makes Django
+    emit ``AddField(<tenant_field>, ForeignKey(default=1, ...),
+    preserve_default=False)``. On the empty DB it is harmless and sails through
+    review, but applied to a POPULATED prod DB it stamps every pre-existing row
+    into whatever tenant has pk=1 -- silently corrupting ownership before RLS is
+    even enabled. The only safe shape is nullable-add -> per-row backfill -> SET
+    NOT NULL, which :func:`scaffold.staged_fk_migration` emits.
+
+    This walks each app's UNAPPLIED migrations via Django's ``MigrationLoader``
+    and flags every ``AddField`` whose field name equals
+    ``conf.tenant_field()`` AND whose field carries a non-``NOT_PROVIDED`` default
+    (the ``default=1, preserve_default=False`` shape). It deliberately matches
+    ONLY the tenant FK column name (and only relation fields) to avoid false
+    positives on legitimate scalar fields that carry an ordinary default.
+
+    Returns a list of ``settings``-shaped findings (warning level -- this is an
+    opt-in heuristic with an AST/serialized-state false-positive surface, NOT a
+    hard gate; it is non-fatal so it never changes the exit code). It is wholly
+    best-effort: any failure loading migrations (no migrations dir, an
+    un-importable migration, ``MigrationLoader`` unavailable, no database) yields
+    an empty list rather than raising, mirroring the rest of this module.
+    """
+    findings = []
+    try:
+        from django.db import connections
+        from django.db.migrations.loader import MigrationLoader
+        from django.db.models import NOT_PROVIDED
+        from django_tenants.utils import get_tenant_database_alias
+    except Exception:
+        return findings
+
+    if connection is None:
+        try:
+            connection = connections[get_tenant_database_alias()]
+        except Exception:
+            return findings
+
+    field = conf.tenant_field()
+
+    try:
+        # ignore_no_migrations: a project may have apps without a migrations
+        # package; we only care about the ones that DO have unapplied migrations.
+        loader = MigrationLoader(connection, ignore_no_migrations=True)
+    except Exception:
+        return findings
+
+    # Unapplied = on disk but not in the applied set. graph.nodes keys are
+    # (app_label, migration_name); loader.applied_migrations is the same key set.
+    try:
+        applied = set(loader.applied_migrations or {})
+        disk_keys = list(loader.disk_migrations.keys())
+    except Exception:
+        return findings
+
+    for key in disk_keys:
+        if key in applied:
+            continue
+        migration = loader.disk_migrations.get(key)
+        if migration is None:
+            continue
+        app_label, migration_name = key
+        for operation in getattr(migration, "operations", []) or []:
+            # Only AddField operations; match by class name so we do not import
+            # the operations module just to isinstance-check it.
+            if operation.__class__.__name__ != "AddField":
+                continue
+            op_field_name = getattr(operation, "name", None)
+            if op_field_name != field:
+                continue
+            op_field = getattr(operation, "field", None)
+            if op_field is None:
+                continue
+            # Only the tenant FK column: a relation field (skip an unrelated
+            # scalar that happens to share the configured name).
+            if not getattr(op_field, "is_relation", False):
+                continue
+            default = getattr(op_field, "default", NOT_PROVIDED)
+            if default is NOT_PROVIDED:
+                continue
+            findings.append({
+                "id": "django_tenants_rls.unsafe_tenant_fk_migration",
+                "level": "warning",
+                "title": "Unsafe unapplied tenant-FK AddField (G1)",
+                "detail": (
+                    "Unapplied migration %s.%s adds the tenant field %r with a "
+                    "non-null default (default=%r, the 'default=1, "
+                    "preserve_default=False' shape makemigrations emits against an "
+                    "empty DB). Applied to a POPULATED database this stamps every "
+                    "pre-existing row into a single tenant, silently corrupting "
+                    "ownership before RLS is enabled."
+                    % (app_label, migration_name, field, default)
+                ),
+                "remedy": (
+                    "Rewrite this as the safe staged shape -- add the FK null=True, "
+                    "backfill each row's real owner, THEN SET NOT NULL -- as "
+                    "emitted by scaffold.staged_fk_migration (or 'manage.py "
+                    "rls_doctor --generate'). Do NOT apply the one-off-default "
+                    "AddField to a populated database."
+                ),
+                "step": 3,
+            })
+
+    return findings
+
+
 def scan(database=None):
     """Scan the project + tenant database and return the readiness report dict.
 
@@ -541,9 +730,22 @@ def scan(database=None):
           "settings": [ {id, level, title, detail, remedy, step}, ... ],
           "models":   [ {label, table, classification, problems,
                          unscoped_rows, remedy, step}, ... ],
+          "external_tables": [ {table, classification, problems, remedy,
+                                step}, ... ],
           "summary":  {done, auto_fixable, generate_migration, manual, blocked},
           "blocked":  bool,   # True if the role bypasses RLS (W003) -> --fix refuses
         }
+
+    The ``external_tables`` section classifies every ``conf.external_tables()``
+    entry (``TENANT_RLS_EXTERNAL_TABLES``) -- contrib/third-party/M2M tables that
+    cannot subclass ``TenantRLSModel`` and so are invisible to the per-model scan
+    -- using the same table-name introspection as ``verify_rls`` / the W008 check
+    (:func:`classify_external_table`). Each entry is ``done`` /
+    ``needs_isolation`` / ``blocked``. When any registered table is not ``done``,
+    an error-level ``settings`` finding (id ``django_tenants_rls.W008``) is also
+    emitted so the ``rls_doctor`` exit-code rule (which already fails on any
+    error-level settings finding) gates the deploy on it -- a green scan now means
+    the registered external tables are isolated too, not just the model tables.
 
     ``database`` defaults to the tenant database alias. The scan is BEST-EFFORT on
     database access: a model whose table is missing, or a DB that is unreachable,
@@ -618,11 +820,66 @@ def scan(database=None):
             "step": step_for[classification],
         })
 
+    # Registered external tables (TENANT_RLS_EXTERNAL_TABLES): contrib/third-party
+    # /M2M tables that cannot subclass TenantRLSModel and so never appear in the
+    # per-model loop above. Classify each with the same table-name introspection
+    # verify_rls / W008 use (classify_external_table) so a green scan covers them
+    # too. A non-done entry is folded into an error-level settings finding below so
+    # the command's exit-code rule (which fails on any error-level setting) gates
+    # on it -- the command itself needs no change.
+    external_step = 7  # docs/rls_migration.rst "Third-party / non-policied tables"
+    external_remedy = (
+        "Isolate the table with the IsolateExternalTable migration operation (or "
+        "apply scaffold.isolate_external_table_sql): ENABLE/FORCE ROW LEVEL "
+        "SECURITY, add a tenant-isolation policy and make its tenant column NOT "
+        "NULL, then re-run 'manage.py verify_rls'."
+    )
+    external_findings = []
+    for table in conf.external_tables():
+        classification, problems = classify_external_table(
+            table, connection, force=force
+        )
+        external_findings.append({
+            "table": table,
+            "classification": classification,
+            "problems": problems,
+            "remedy": "" if classification == "done" else external_remedy,
+            "step": external_step,
+        })
+
+    # Optional, best-effort static scan for an unsafe UNAPPLIED tenant-FK AddField
+    # (the default=1 / preserve_default=False landmine). Non-fatal: warning-level
+    # findings only, so it never changes the exit code -- it catches the landmine
+    # BEFORE migrate runs on prod, where the live-DB introspection above cannot.
+    settings_findings.extend(
+        unsafe_tenant_fk_migration_findings(connection)
+    )
+
+    not_done_external = [
+        f for f in external_findings if f["classification"] != "done"
+    ]
+    if not_done_external:
+        offenders = ", ".join(sorted(f["table"] for f in not_done_external))
+        settings_findings.append({
+            "id": checks.W008_ID,
+            "level": "error",
+            "title": "External tables not isolated (W008)",
+            "detail": (
+                "%d registered external table(s) in TENANT_RLS_EXTERNAL_TABLES "
+                "are not RLS-isolated (RLS off / unforced / no policy / nullable "
+                "tenant column, or the role bypasses RLS): %s. Their rows are "
+                "shared across all tenants." % (len(not_done_external), offenders)
+            ),
+            "remedy": external_remedy,
+            "step": external_step,
+        })
+
     return {
         "rls_enabled": conf.rls_enabled(),
         "database": alias,
         "settings": settings_findings,
         "models": model_findings,
+        "external_tables": external_findings,
         "summary": summary,
         "blocked": blocked,
     }
