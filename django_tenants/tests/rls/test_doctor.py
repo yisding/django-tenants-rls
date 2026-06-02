@@ -324,6 +324,47 @@ class ClassifyModelTestCase(unittest.TestCase):
         self.assertIsInstance(problems, list)
 
     @override_settings(TENANT_RLS_ENABLED=True)
+    def test_generate_migration_for_tenant_column_collision(self):
+        # A non-FK column colliding with the tenant FK column (the denormalized
+        # 'tenant_id' foot-gun, models.E006) makes RLS unworkable: it is a
+        # code/schema fix that must NOT be auto-run -> generate_migration. The
+        # collision is surfaced even when RLS otherwise looks live, and short-
+        # circuits before any DB introspection.
+        model = _FakeModel()
+        with mock.patch.object(
+            doctor, "_collision_problems",
+            return_value=["field 'tenant_id' occupies column 'tenant_id', which "
+                          "collides with the tenant ForeignKey 'tenant'"],
+        ), _patch_doctor_attr("rls_live_problems", return_value=[]):
+            classification, problems = doctor.classify_model(
+                model, _FakeConnection(), force=True
+            )
+        self.assertEqual(classification, "generate_migration")
+        self.assertTrue(problems)
+        self.assertTrue(any("collides with the tenant" in p for p in problems))
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_collision_problems_composes_checks_helper(self):
+        # The doctor's collision finding is exactly checks.tenant_column_collisions:
+        # patch the composed helper and assert the doctor surfaces a string per
+        # collision (a (field_name, column) tuple) naming both.
+        model = _FakeModel()
+        with mock.patch.object(
+            checks, "tenant_column_collisions",
+            return_value=[("tenant_id", "tenant_id")],
+        ):
+            problems = doctor._collision_problems(model)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("tenant_id", problems[0])
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_no_collision_by_default(self):
+        # A plain fake model declares no colliding column, so the doctor reports no
+        # collision problems and classification is unaffected.
+        model = _FakeModel()
+        self.assertEqual(doctor._collision_problems(model), [])
+
+    @override_settings(TENANT_RLS_ENABLED=True)
     def test_has_unscoped_rows_db_error_degrades_not_raises(self):
         # Best-effort: has_unscoped_rows() raising (DB unreachable) must not crash
         # classify_model -- it degrades to a finding / a non-"done" classification.

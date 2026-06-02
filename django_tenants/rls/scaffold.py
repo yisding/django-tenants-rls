@@ -22,7 +22,13 @@ Each generator composes the existing primitives rather than re-deriving the DDL:
   WITH CHECK clauses come straight from
   :meth:`~django_tenants.rls.policies.TenantPolicy.get_using_expression` /
   :meth:`~django_tenants.rls.policies.TenantPolicy.get_check_expression` so the
-  DDL is byte-identical to what the framework's schema editor would emit.
+  DDL is byte-identical to what the framework's schema editor would emit. It emits
+  the *policy* only and assumes the tenant column already exists.
+* :func:`isolate_external_table_sql` emits the FULL ordered prerequisite sequence
+  for such a table -- ADD COLUMN with a GUC-reading DEFAULT + tenant FK, a backfill
+  STUB, an optional ``SET NOT NULL``, UNIQUE rewrites, then the policy -- and points
+  at :class:`~django_tenants.rls.operations.IsolateExternalTable`, the reversible
+  migration operation that performs the same sequence.
 * :func:`unique_constraint_migration` emits ``AddConstraint`` of a
   tenant-scoped ``UniqueConstraint`` + ``RemoveConstraint`` of the old one
   (Step 8).
@@ -307,7 +313,11 @@ def third_party_policy_sql(table, *, pk_cast="integer"):
 --   UPDATE {q_table} SET {field}_id = <owner> WHERE {field}_id IS NULL;  -- backfill
 --   ALTER TABLE {q_table} ALTER COLUMN {field}_id SET NOT NULL;
 --   -- and tenant-scope any global UNIQUE (e.g. UNIQUE ({field}_id, <key>))
--- See docs/rls_migration.rst "Third-party / non-policied tables".
+-- See docs/rls_migration.rst "Third-party / non-policied tables". To emit the
+-- FULL ordered prerequisite sequence (column + GUC default + FK -> backfill stub
+-- -> optional SET NOT NULL -> UNIQUE rewrite -> policy) as one reversible
+-- migration step, use isolate_external_table_sql(...) /
+-- django_tenants.rls.operations.IsolateExternalTable instead of this policy-only DDL.
 -- Drop any existing same-named policy first so this is re-runnable.
 
 ALTER TABLE {q_table} ENABLE ROW LEVEL SECURITY;
@@ -329,6 +339,178 @@ CREATE POLICY {q_policy} ON {q_table}
         q_policy=q_policy,
         using=using,
         check=check,
+    )
+
+
+# Postgres column type for each tenant-PK cast suffix; the tenant column added to
+# an external table must be the SAME type as the tenant model's PK.
+_PK_CAST_TO_COLUMN_TYPE = {
+    "integer": "integer",
+    "bigint": "bigint",
+    "uuid": "uuid",
+    "text": "text",
+}
+
+
+def isolate_external_table_sql(table, *, pk_cast="integer", not_null=False,
+                               unique_rewrites=None):
+    """Return the FULL ordered DDL to tenant-isolate an external ``table`` (Step 7).
+
+    Unlike :func:`third_party_policy_sql` (which emits the *policy* only and assumes
+    the tenant column already exists), this emits the **entire prerequisite
+    sequence** for a table you cannot subclass (``auth_user``, ``django_session``,
+    an external package's table, an M2M *through* table):
+
+    1. ``ADD COLUMN <tenant_field>_id`` of the tenant PK type, with a column
+       ``DEFAULT`` reading the tenant GUC
+       (``NULLIF(current_setting('<session var>', true), '')::<cast>``) and a
+       ``REFERENCES <TENANT_MODEL table> ON DELETE CASCADE`` FK -- added NULLABLE so
+       it can be applied to an already-populated table without a NOT NULL violation;
+    2. a commented backfill STUB (Step 4, app-specific and DANGEROUS -- never
+       emitted as runnable SQL);
+    3. an optional ``ALTER COLUMN ... SET NOT NULL`` (only when ``not_null=True``;
+       it REQUIRES the Step 2 backfill to have completed first);
+    4. for each ``unique_rewrites`` entry ``(old_constraint_name, [new_columns])``,
+       a ``DROP CONSTRAINT`` + tenant-scoped ``ADD CONSTRAINT ... UNIQUE`` (Postgres
+       checks UNIQUE with RLS bypassed, so every global UNIQUE is a covert channel);
+    5. ``ENABLE`` + ``FORCE ROW LEVEL SECURITY`` and the ``CREATE POLICY`` -- whose
+       USING / WITH CHECK come verbatim from :class:`~django_tenants.rls.policies.TenantPolicy`
+       so it is byte-identical to a first-party model's policy.
+
+    The emitted SQL is a runnable ``psql`` script (the backfill is a commented
+    STUB). For a version-controlled, reversible alternative, the header points at
+    :class:`~django_tenants.rls.operations.IsolateExternalTable`, which performs the
+    same sequence as a single migration operation.
+
+    ``pk_cast`` is the Postgres cast suffix matching the tenant model's PK type
+    (``integer`` / ``bigint`` / ``uuid`` / ``text``); pass
+    ``conf.get_tenant_pk_cast()`` when in doubt. ``unique_rewrites`` is a list of
+    ``(old_constraint_name, [new_columns])`` to rewrite tenant-scoped (typically
+    prepend ``<tenant_field>_id``).
+    """
+    from django.conf import settings
+    from . import conf
+    from .models import _default_policy_name
+    from .policies import TenantPolicy
+
+    field = conf.tenant_field()
+    column = "%s_id" % field
+    session_var = conf.session_variable()
+    tenant_model = settings.TENANT_MODEL
+
+    col_type = _PK_CAST_TO_COLUMN_TYPE.get(pk_cast, pk_cast)
+
+    policy_name = _default_policy_name(table)
+    policy = TenantPolicy(name=policy_name, tenant_field=field, pk_cast=pk_cast)
+    using = policy.get_using_expression()
+    check = policy.get_check_expression()
+
+    q_table = _quote_ident(table)
+    q_col = _quote_ident(column)
+    q_policy = _quote_ident(policy_name)
+
+    # The column DEFAULT reads the tenant GUC -- same shape as the policy's RHS so
+    # rows inserted under an active tenant are auto-stamped and pass WITH CHECK.
+    guc_default = "NULLIF(current_setting('%s', true), '')::%s" % (
+        session_var.replace("'", "''"), pk_cast,
+    )
+
+    # (3) optional SET NOT NULL -- runnable only after the backfill.
+    if not_null:
+        not_null_sql = (
+            "\n-- (3) Tighten to NOT NULL. APPLY ONLY AFTER the backfill above has run\n"
+            "--     and you have verified zero NULL %s rows.\n"
+            "ALTER TABLE %s ALTER COLUMN %s SET NOT NULL;\n"
+            % (column, q_table, q_col)
+        )
+    else:
+        not_null_sql = (
+            "\n-- (3) Tighten to NOT NULL once the backfill is complete and verified\n"
+            "--     (zero NULL %s rows). Pass not_null=True to emit this, or run:\n"
+            "-- ALTER TABLE %s ALTER COLUMN %s SET NOT NULL;\n"
+            % (column, q_table, q_col)
+        )
+
+    # (4) UNIQUE rewrites -- each leaky global UNIQUE made tenant-scoped.
+    if unique_rewrites:
+        lines = [
+            "\n-- (4) Tenant-scope every global UNIQUE (Postgres checks UNIQUE with RLS\n"
+            "--     bypassed, so a tenant-blind UNIQUE is a covert cross-tenant channel)."
+        ]
+        for old_name, new_columns in unique_rewrites:
+            new_name = ("%s_per_tenant" % old_name)[:63]
+            cols = ", ".join(_quote_ident(c) for c in new_columns)
+            lines.append(
+                "ALTER TABLE %s DROP CONSTRAINT %s;"
+                % (q_table, _quote_ident(old_name))
+            )
+            lines.append(
+                "ALTER TABLE %s ADD CONSTRAINT %s UNIQUE (%s);"
+                % (q_table, _quote_ident(new_name), cols)
+            )
+        unique_sql = "\n".join(lines) + "\n"
+    else:
+        unique_sql = (
+            "\n-- (4) Tenant-scope EVERY global UNIQUE on this table (Postgres checks\n"
+            "--     UNIQUE with RLS bypassed, so each is a covert cross-tenant channel).\n"
+            "--     Pass unique_rewrites=[(old_constraint_name, [%r, <key>...]), ...]\n"
+            "--     to emit DROP + tenant-scoped ADD for each, e.g.:\n"
+            "-- ALTER TABLE %s DROP CONSTRAINT <old_uniq>;\n"
+            "-- ALTER TABLE %s ADD CONSTRAINT <old_uniq>_per_tenant UNIQUE (%s, <key>);\n"
+            % (column, q_table, q_table, column)
+        )
+
+    return '''\
+-- Tenant-isolate external table "{table}" under RLS (RLS migration Step 7, FULL sequence).
+--
+-- Generated by ``manage.py rls_doctor --generate``. Review, then apply with psql,
+-- or use django_tenants.rls.operations.IsolateExternalTable("{table}", ...) for a
+-- version-controlled, REVERSIBLE migration that performs this same sequence.
+--
+-- For a table you CANNOT make inherit TenantRLSModel (auth_user, django_session,
+-- a third-party / vendored table, an M2M through-table). Such a table otherwise
+-- lands unpolicied in the shared public schema and silently shares rows across
+-- every tenant. This emits the FULL ordered prerequisite sequence -- the policy
+-- (step 5) is byte-identical to the framework's default TenantPolicy.
+
+-- (1) Add the tenant column NULLABLE, with a DEFAULT reading the tenant GUC and a
+--     FK to the tenant model. NULLABLE so it can be added to an already-populated
+--     table without a NOT NULL violation; the GUC default auto-stamps new rows.
+ALTER TABLE {q_table} ADD COLUMN {q_col} {col_type}
+    DEFAULT ({guc_default})
+    REFERENCES <tenant table for {tenant_model}> (<tenant pk>) ON DELETE CASCADE;
+
+-- (2) {backfill_todo} every existing {table} row to its owning tenant. App-specific
+--     and DANGEROUS -- the assistant never emits runnable backfill SQL. Run this
+--     under bypass_rls() (no policy exists yet, but make it a habit) BEFORE step 3:
+-- UPDATE {q_table} SET {q_col} = <resolve owning tenant> WHERE {q_col} IS NULL;
+{not_null_sql}{unique_sql}
+-- (5) Enable (+ FORCE so the policy binds the table owner too) RLS and create the
+--     tenant-isolation policy -- byte-identical to TenantPolicy(pk_cast="{pk_cast}").
+--     Drop any same-named policy first so this is re-runnable.
+ALTER TABLE {q_table} ENABLE ROW LEVEL SECURITY;
+ALTER TABLE {q_table} FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS {q_policy} ON {q_table};
+
+CREATE POLICY {q_policy} ON {q_table}
+    AS PERMISSIVE FOR ALL TO public
+    USING ({using})
+    WITH CHECK ({check});
+'''.format(
+        table=table,
+        q_table=q_table,
+        q_col=q_col,
+        col_type=col_type,
+        guc_default=guc_default,
+        tenant_model=tenant_model,
+        pk_cast=pk_cast,
+        q_policy=q_policy,
+        using=using,
+        check=check,
+        not_null_sql=not_null_sql,
+        unique_sql=unique_sql,
+        backfill_todo=_BACKFILL_TODO,
     )
 
 

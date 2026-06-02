@@ -130,6 +130,29 @@ def _has_tenant_field(model):
         return False
 
 
+def _collision_problems(model):
+    """Return human-readable strings for non-FK columns colliding with tenant FK.
+
+    Composes :func:`checks.tenant_column_collisions` (the same enumeration the E003
+    system check uses) so the doctor's "column collides with the tenant FK" finding
+    is exactly the set the check would flag. A classic pre-cutover foot-gun is a
+    denormalized integer ``tenant_id`` carried over from schema-per-tenant data,
+    which clashes with the tenant ForeignKey's ``<tenant_field>_id`` column. Pure
+    model introspection -- no DB access.
+    """
+    field = conf.tenant_field()
+    problems = []
+    for name, column in checks.tenant_column_collisions(model):
+        problems.append(
+            "field %r occupies column %r, which collides with the tenant "
+            "ForeignKey %r (also column %r): RLS is enforced through that column, "
+            "so rename/drop the field or set TENANT_RLS_TENANT_FIELD to another "
+            "name (Django reports this clash as models.E006)"
+            % (name, column, field, column)
+        )
+    return problems
+
+
 def _has_unscoped_rows(model, connection):
     """Whether ``model``'s table has rows with a NULL tenant FK, on ``connection``.
 
@@ -173,12 +196,14 @@ def classify_model(model, connection, *, force):
        first because nothing below it matters while the role can see everything.
     2. ``done`` -- :func:`checks.rls_live_problems` is empty: RLS is enabled (and
        forced when ``force``), a policy exists and the tenant column is NOT NULL.
-    3. ``generate_migration`` -- a schema change is owed that must go through a
-       migration/scaffold (never auto-run): no tenant FK at all (Step 3), a
-       nullable tenant column (Steps 3/5), or a UNIQUE constraint omitting the
-       tenant (Step 8). The nullable-column signal is taken from
-       ``rls_live_problems`` (the word "NULLABLE" in a problem string) so we do
-       not duplicate its information_schema query.
+    3. ``generate_migration`` -- a schema/code change is owed that must go through a
+       migration/scaffold (never auto-run): no tenant FK at all (Step 3), a non-FK
+       column colliding with the tenant FK column (the denormalized-``tenant_id``
+       foot-gun; reported by Django as models.E006), a nullable tenant column
+       (Steps 3/5), or a UNIQUE constraint omitting the tenant (Step 8). The
+       nullable-column signal is taken from ``rls_live_problems`` (the word
+       "NULLABLE" in a problem string) so we do not duplicate its
+       information_schema query.
     4. ``manual`` -- the table has unscoped (tenant IS NULL) rows: a cross-schema
        backfill (Step 4) is owed, which is app-specific and must not be auto-run.
        Ranked below ``generate_migration`` because a NULL *column* (schema) must
@@ -202,6 +227,15 @@ def classify_model(model, connection, *, force):
     # Pure-model UNIQUE problems (no DB) are always worth surfacing; they force at
     # least a generate_migration regardless of the live RLS state.
     unique_problems = _unique_problems(model)
+
+    # A non-FK column colliding with the tenant FK column (the denormalized
+    # ``tenant_id`` foot-gun, reported by Django as models.E006) makes RLS
+    # unworkable: the policy is enforced through that very column. This is a
+    # code/schema fix that must NOT be auto-run, so short-circuit to
+    # generate_migration before any (misleading) DB introspection.
+    collision_problems = _collision_problems(model)
+    if collision_problems:
+        return "generate_migration", collision_problems + unique_problems
 
     # A model with no tenant field at all cannot be live and needs the staged FK
     # migration (Step 3). rls_live_problems would also fail to find the column, so
