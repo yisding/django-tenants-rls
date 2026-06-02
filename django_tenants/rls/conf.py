@@ -26,6 +26,7 @@ DEFAULTS = {
     "TENANT_RLS_FORCE": True,
     "TENANT_RLS_AUTO_ENABLE": True,
     "TENANT_RLS_ALLOW_BYPASS_ROLE": False,
+    "TENANT_RLS_EXTERNAL_TABLES": (),
 }
 
 # Postgres GUC custom variable names must be of the form "<class>.<name>".
@@ -105,6 +106,38 @@ def allow_bypass_role():
     is an explicit, documented opt-out that DISABLES that safety net.
     """
     return bool(_get("TENANT_RLS_ALLOW_BYPASS_ROLE"))
+
+
+def external_tables():
+    """Raw tables that must be RLS-protected but cannot subclass ``TenantRLSModel``.
+
+    Returns the configured ``TENANT_RLS_EXTERNAL_TABLES`` as a validated tuple of
+    bare (optionally schema-qualified) identifiers, e.g.
+    ``('authtoken_token', 'agent_test_through_x')`` or ``('myschema.foo',)``.
+
+    This is the single source of truth that ``verify_rls``, the doctor, and the
+    W008 deploy check consult for external/contrib/M2M tables (auth tokens,
+    contrib auth/sessions, isolated M2M through-tables) that every model-only
+    verifier would otherwise silently ignore.
+
+    Each entry is validated with the same defensive posture as
+    ``session_variable()`` / ``tenant_field()``: every part of a (possibly
+    schema-qualified) name must be a plain identifier, since the table name is
+    embedded into policy DDL and cannot be parameterized there. A non-identifier
+    raises ``ImproperlyConfigured``.
+    """
+    raw = _get("TENANT_RLS_EXTERNAL_TABLES")
+    tables = []
+    for entry in raw:
+        if not isinstance(entry, str) or not all(
+            FIELD_NAME_PATTERN.match(part) for part in entry.split(".")
+        ):
+            raise ImproperlyConfigured(
+                "TENANT_RLS_EXTERNAL_TABLES entry %r is not a valid "
+                "(optionally schema-qualified) table identifier." % (entry,)
+            )
+        tables.append(entry)
+    return tuple(tables)
 
 
 def get_tenant_pk_cast():

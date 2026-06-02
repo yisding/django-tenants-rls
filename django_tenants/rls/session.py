@@ -160,6 +160,35 @@ def get_current_tenant_id(connection=None, using=None):
     return value
 
 
+class NoActiveTenant(RuntimeError):
+    """
+    Raised by ``require_current_tenant`` when no tenant is active on the
+    connection. It subclasses ``RuntimeError`` so out-of-request entrypoints
+    (thread-pool dispatch, signal subscribers, ASGI/Channels consumers,
+    management commands) fail loudly instead of running silently against zero
+    rows.
+    """
+
+
+def require_current_tenant(using=None):
+    """
+    Return the active tenant id on the ``using`` alias, or raise
+    ``NoActiveTenant`` if none is set.
+
+    Use this as a fail-loud guard at the top of out-of-request code paths that
+    must establish tenant context themselves: a missing tenant otherwise reads
+    or writes against zero rows silently (fail-closed) rather than raising.
+    """
+    tid = get_current_tenant_id(using=using)
+    if tid is None:
+        raise NoActiveTenant(
+            "No active tenant on this connection. Wrap this code in "
+            "rls_context(tenant_or_pk) (or bypass_rls() for deliberate "
+            "cross-tenant work) before touching RLS models."
+        )
+    return tid
+
+
 def set_bypass(connection=None, value=True, using=None):
     """
     Set the bypass session variable to the literal 'on' (when ``value`` is true)
