@@ -66,6 +66,72 @@ class _EditorBuilder:
         return se
 
 
+class _FakeOps:
+    """Minimal ``connection.ops`` exposing ``quote_name`` (double-quote style)."""
+
+    def quote_name(self, name):
+        return '"%s"' % name
+
+
+class _FakeConnection:
+    def __init__(self, vendor="postgresql"):
+        self.vendor = vendor
+        self.ops = _FakeOps()
+
+
+class _SqlRecordingEditor:
+    """A schema editor that records raw ``execute(sql)`` calls (no DB).
+
+    Used for :class:`~django_tenants.rls.operations.IsolateExternalTable`, which
+    emits raw DDL via ``schema_editor.execute(...)`` rather than the
+    ``create_policy`` / ``enable_rls`` helper methods.
+    """
+
+    def __init__(self, vendor="postgresql"):
+        self.connection = _FakeConnection(vendor=vendor)
+        self.executed = []
+
+    def execute(self, sql, params=None):
+        self.executed.append(sql)
+
+    @property
+    def sql(self):
+        return "\n".join(self.executed)
+
+
+# A fake tenant model so IsolateExternalTable can resolve the TENANT_MODEL table /
+# PK without the app registry (it lazily imports django_tenants.utils.get_tenant_model).
+class _FakePk:
+    def __init__(self, column="id"):
+        self.column = column
+
+
+class _FakeTenantMeta:
+    def __init__(self, db_table="customers_tenant", pk_column="id"):
+        self.db_table = db_table
+        self.pk = _FakePk(pk_column)
+
+
+class _FakeTenantModel:
+    def __init__(self, db_table="customers_tenant", pk_column="id"):
+        self._meta = _FakeTenantMeta(db_table, pk_column)
+
+
+class _TenantModelPatchMixin:
+    """Monkeypatch ``django_tenants.utils.get_tenant_model`` for the test body."""
+
+    def setUp(self):
+        super().setUp()
+        from django_tenants import utils
+        self._utils = utils
+        self._orig_get_tenant_model = utils.get_tenant_model
+        utils.get_tenant_model = lambda: _FakeTenantModel()
+
+    def tearDown(self):
+        self._utils.get_tenant_model = self._orig_get_tenant_model
+        super().tearDown()
+
+
 class EnableRLSTestCase(unittest.TestCase):
     def setUp(self):
         self.model = FakeModel()
@@ -309,6 +375,236 @@ class DropPolicyTestCase(unittest.TestCase):
         self.assertEqual(len(dropped), 1)
 
 
+class IsolateExternalTableTestCase(_TenantModelPatchMixin, unittest.TestCase):
+    """``IsolateExternalTable`` -- isolate a non-TenantRLSModel table under RLS.
+
+    The full prerequisite sequence (ADD COLUMN w/ GUC default + FK -> optional SET
+    NOT NULL -> UNIQUE rewrites -> ENABLE/FORCE -> CREATE POLICY) is emitted as raw
+    DDL via ``schema_editor.execute``; the tests assert the forward/backward SQL,
+    the off-Postgres no-op via the vendor guard, and that the policy matches the
+    framework ``TenantPolicy``. No database is touched.
+    """
+
+    def _state(self):
+        # IsolateExternalTable does not resolve a model from state, but
+        # database_forwards/backwards still receive a state argument.
+        return FakeState(FakeModel())
+
+    def test_describe(self):
+        op = operations.IsolateExternalTable("authtoken_token", pk_cast="integer")
+        self.assertEqual(
+            op.describe(),
+            "Tenant-isolate external table authtoken_token under RLS",
+        )
+
+    @override_settings(TENANT_RLS_ENABLED=True, TENANT_RLS_FORCE=True)
+    def test_forwards_emits_add_column_with_guc_default_and_fk(self):
+        se = _SqlRecordingEditor()
+        op = operations.IsolateExternalTable("authtoken_token", pk_cast="integer")
+        op.database_forwards("rls", se, self._state(), self._state())
+        sql = se.sql
+        # ADD COLUMN <tenant_field>_id of the tenant PK type.
+        self.assertIn('ALTER TABLE "authtoken_token" ADD COLUMN "tenant_id" integer', sql)
+        # Column DEFAULT reads the tenant GUC (NULLIF(current_setting(...), '')::cast).
+        self.assertIn(
+            "DEFAULT (NULLIF(current_setting('django_tenants.tenant_id', true), '')::integer)",
+            sql,
+        )
+        # FK to the resolved TENANT_MODEL table/PK, ON DELETE CASCADE.
+        self.assertIn('REFERENCES "customers_tenant" ("id") ON DELETE CASCADE', sql)
+
+    @override_settings(TENANT_RLS_ENABLED=True, TENANT_RLS_FORCE=True)
+    def test_forwards_enables_and_forces_rls(self):
+        se = _SqlRecordingEditor()
+        op = operations.IsolateExternalTable("authtoken_token", pk_cast="integer")
+        op.database_forwards("rls", se, self._state(), self._state())
+        sql = se.sql
+        self.assertIn('ALTER TABLE "authtoken_token" ENABLE ROW LEVEL SECURITY', sql)
+        self.assertIn('ALTER TABLE "authtoken_token" FORCE ROW LEVEL SECURITY', sql)
+
+    @override_settings(TENANT_RLS_ENABLED=True, TENANT_RLS_FORCE=False)
+    def test_forwards_does_not_force_when_force_disabled(self):
+        se = _SqlRecordingEditor()
+        op = operations.IsolateExternalTable("authtoken_token", pk_cast="integer")
+        op.database_forwards("rls", se, self._state(), self._state())
+        sql = se.sql
+        self.assertIn("ENABLE ROW LEVEL SECURITY", sql)
+        self.assertNotIn("FORCE ROW LEVEL SECURITY", sql)
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_forwards_policy_is_byte_identical_to_framework_policy(self):
+        se = _SqlRecordingEditor()
+        op = operations.IsolateExternalTable("authtoken_token", pk_cast="integer")
+        op.database_forwards("rls", se, self._state(), self._state())
+        sql = se.sql
+        policy = TenantPolicy(
+            name="authtoken_token_tenant_isolation", pk_cast="integer",
+        )
+        using = policy.get_using_expression()
+        check = policy.get_check_expression()
+        # The InitPlan sub-SELECT form must be reproduced verbatim.
+        self.assertIn("SELECT NULLIF(current_setting(", using)
+        self.assertIn(using, sql)
+        self.assertIn(check, sql)
+        # PERMISSIVE FOR ALL TO public -- the framework's create_policy shape.
+        self.assertIn(
+            'CREATE POLICY "authtoken_token_tenant_isolation" ON "authtoken_token" '
+            "AS PERMISSIVE FOR ALL TO public",
+            sql,
+        )
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_forwards_not_null_only_when_requested(self):
+        se = _SqlRecordingEditor()
+        op = operations.IsolateExternalTable("authtoken_token", pk_cast="integer")
+        op.database_forwards("rls", se, self._state(), self._state())
+        self.assertNotIn("SET NOT NULL", se.sql)
+
+        se2 = _SqlRecordingEditor()
+        op2 = operations.IsolateExternalTable(
+            "authtoken_token", pk_cast="integer", not_null=True,
+        )
+        op2.database_forwards("rls", se2, self._state(), self._state())
+        self.assertIn(
+            'ALTER TABLE "authtoken_token" ALTER COLUMN "tenant_id" SET NOT NULL',
+            se2.sql,
+        )
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_forwards_unique_rewrites_drop_and_add_tenant_scoped(self):
+        se = _SqlRecordingEditor()
+        op = operations.IsolateExternalTable(
+            "authtoken_token", pk_cast="integer",
+            unique_rewrites=[("authtoken_token_user_id_key", ["tenant_id", "user_id"])],
+        )
+        op.database_forwards("rls", se, self._state(), self._state())
+        sql = se.sql
+        self.assertIn(
+            'ALTER TABLE "authtoken_token" DROP CONSTRAINT "authtoken_token_user_id_key"',
+            sql,
+        )
+        # The new constraint is tenant-scoped over the supplied columns.
+        self.assertIn('UNIQUE ("tenant_id", "user_id")', sql)
+
+    @override_settings(TENANT_RLS_ENABLED=True, TENANT_RLS_FORCE=True)
+    def test_forwards_ordering_column_before_policy(self):
+        # The column (and its GUC default) must be added BEFORE ENABLE/CREATE POLICY
+        # so the policy's tenant_id reference is valid.
+        se = _SqlRecordingEditor()
+        op = operations.IsolateExternalTable("authtoken_token", pk_cast="integer")
+        op.database_forwards("rls", se, self._state(), self._state())
+        joined = se.sql
+        add_idx = joined.index("ADD COLUMN")
+        enable_idx = joined.index("ENABLE ROW LEVEL SECURITY")
+        policy_idx = joined.index("CREATE POLICY")
+        self.assertLess(add_idx, enable_idx)
+        self.assertLess(enable_idx, policy_idx)
+
+    @override_settings(TENANT_RLS_ENABLED=True, TENANT_RLS_FORCE=True)
+    def test_backwards_drops_policy_disables_rls_and_drops_column(self):
+        se = _SqlRecordingEditor()
+        op = operations.IsolateExternalTable("authtoken_token", pk_cast="integer")
+        op.database_backwards("rls", se, self._state(), self._state())
+        sql = se.sql
+        self.assertIn(
+            'DROP POLICY IF EXISTS "authtoken_token_tenant_isolation" ON "authtoken_token"',
+            sql,
+        )
+        self.assertIn('ALTER TABLE "authtoken_token" NO FORCE ROW LEVEL SECURITY', sql)
+        self.assertIn('ALTER TABLE "authtoken_token" DISABLE ROW LEVEL SECURITY', sql)
+        self.assertIn('ALTER TABLE "authtoken_token" DROP COLUMN "tenant_id"', sql)
+        # Drop policy must precede dropping the column (reverse of forwards order).
+        self.assertLess(sql.index("DROP POLICY"), sql.index("DROP COLUMN"))
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_backwards_restores_rewritten_unique(self):
+        se = _SqlRecordingEditor()
+        op = operations.IsolateExternalTable(
+            "authtoken_token", pk_cast="integer",
+            unique_rewrites=[("authtoken_token_user_id_key", ["tenant_id", "user_id"])],
+        )
+        op.database_backwards("rls", se, self._state(), self._state())
+        sql = se.sql
+        # The tenant-scoped replacement is dropped and the original-named UNIQUE
+        # is re-added on the non-tenant columns.
+        self.assertIn(
+            'DROP CONSTRAINT "authtoken_token_user_id_key_per_tenant"', sql,
+        )
+        self.assertIn(
+            'ADD CONSTRAINT "authtoken_token_user_id_key" UNIQUE ("user_id")', sql,
+        )
+
+    def test_forwards_is_noop_off_postgresql(self):
+        se = _SqlRecordingEditor(vendor="sqlite")
+        op = operations.IsolateExternalTable("authtoken_token", pk_cast="integer")
+        op.database_forwards("rls", se, self._state(), self._state())
+        self.assertEqual(se.executed, [])
+
+    def test_backwards_is_noop_off_postgresql(self):
+        se = _SqlRecordingEditor(vendor="mysql")
+        op = operations.IsolateExternalTable("authtoken_token", pk_cast="integer")
+        op.database_backwards("rls", se, self._state(), self._state())
+        self.assertEqual(se.executed, [])
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_uuid_pk_cast_uses_uuid_column_type_and_cast(self):
+        se = _SqlRecordingEditor()
+        op = operations.IsolateExternalTable("ext_table", pk_cast="uuid")
+        op.database_forwards("rls", se, self._state(), self._state())
+        sql = se.sql
+        self.assertIn('ADD COLUMN "tenant_id" uuid', sql)
+        self.assertIn("::uuid", sql)
+        self.assertNotIn("::integer", sql)
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_custom_tenant_field_changes_column_name(self):
+        se = _SqlRecordingEditor()
+        op = operations.IsolateExternalTable(
+            "ext_table", tenant_field="org", pk_cast="bigint",
+        )
+        op.database_forwards("rls", se, self._state(), self._state())
+        sql = se.sql
+        self.assertIn('ADD COLUMN "org_id" bigint', sql)
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_deconstruct_emits_table_and_snapshotted_pk_cast(self):
+        op = operations.IsolateExternalTable(
+            "authtoken_token", tenant_field="tenant", pk_cast="integer",
+        )
+        name, args, kwargs = op.deconstruct()
+        self.assertEqual(name, "IsolateExternalTable")
+        self.assertEqual(args, ["authtoken_token"])
+        self.assertEqual(kwargs["tenant_field"], "tenant")
+        # pk_cast is snapshotted and always emitted for reproducibility.
+        self.assertEqual(kwargs["pk_cast"], "integer")
+        # Defaults are omitted to keep makemigrations stable.
+        self.assertNotIn("not_null", kwargs)
+        self.assertNotIn("unique_rewrites", kwargs)
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_deconstruct_emits_non_default_options(self):
+        op = operations.IsolateExternalTable(
+            "authtoken_token", pk_cast="integer", not_null=True,
+            unique_rewrites=[("authtoken_token_user_id_key", ["tenant_id", "user_id"])],
+        )
+        _, _, kwargs = op.deconstruct()
+        self.assertEqual(kwargs["not_null"], True)
+        self.assertEqual(
+            kwargs["unique_rewrites"],
+            [("authtoken_token_user_id_key", ["tenant_id", "user_id"])],
+        )
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_deconstructed_tuple_rebuilds_equivalent_operation(self):
+        op = operations.IsolateExternalTable(
+            "authtoken_token", pk_cast="uuid", not_null=True,
+            unique_rewrites=[("uniq_old", ["tenant_id", "key"])],
+        )
+        _, args, kwargs = op.deconstruct()
+        rebuilt = operations.IsolateExternalTable(*args, **kwargs)
+        self.assertEqual(rebuilt.deconstruct(), op.deconstruct())
+
+
 class OperationWriterSerializationTestCase(unittest.TestCase):
     """Round-trip the operations through Django's real migration serializer.
 
@@ -343,4 +639,22 @@ class OperationWriterSerializationTestCase(unittest.TestCase):
         self.assertIn("TenantPolicy", rendered)
         self.assertTrue(
             any("django_tenants.rls.policies" in imp for imp in imports)
+        )
+
+    @override_settings(TENANT_RLS_ENABLED=True)
+    def test_isolate_external_table_serializes(self):
+        from django.db.migrations.writer import OperationWriter
+
+        op = operations.IsolateExternalTable(
+            "authtoken_token", tenant_field="tenant", pk_cast="integer",
+            not_null=True,
+            unique_rewrites=[("authtoken_token_user_id_key", ["tenant_id", "user_id"])],
+        )
+        rendered, imports = OperationWriter(op).serialize()
+        self.assertIsInstance(rendered, str)
+        self.assertIn("'authtoken_token'", rendered)
+        self.assertIn("pk_cast='integer'", rendered)
+        self.assertIn("not_null=True", rendered)
+        self.assertTrue(
+            any("django_tenants.rls.operations" in imp for imp in imports)
         )
