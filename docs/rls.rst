@@ -159,9 +159,18 @@ block).
 Step 1 -- Install and add to SHARED_APPS
 ========================================
 
-``django_tenants.rls`` ships inside the ``django-tenants`` package; there is
-nothing extra to install. Add it to ``SHARED_APPS`` (it must be a *shared* app
-because, in RLS mode, everything lives in ``public``):
+``django_tenants.rls`` ships inside the ``django-tenants`` package, so there is
+nothing extra to ``pip install`` -- **but only when your installed build is one
+that actually contains the rls subpackage.** A wheel built from a tree that
+ships it (this repository does) includes ``django_tenants.rls``; an arbitrary
+public PyPI pin that predates the RLS release does **not**, and converted code
+then dies at import with ``ModuleNotFoundError: No module named
+'django_tenants.rls'``. Before converting any code, make sure every environment
+(local, CI, migration-check, deploy) resolves an RLS-capable build -- see the
+install/availability prerequisite in the :doc:`migration guide <rls_migration>`.
+
+Add it to ``SHARED_APPS`` (it must be a *shared* app because, in RLS mode,
+everything lives in ``public``):
 
 .. code-block:: python
 

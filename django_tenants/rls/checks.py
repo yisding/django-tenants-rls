@@ -5,9 +5,10 @@ opted into RLS see no warnings or errors at all. The checks are registered via
 the ``@register`` decorators below; they are wired into Django by importing this
 module from ``DjangoTenantsRLSConfig.ready()``.
 
-The production-relevant checks (W001, W003, W004, W005, E002) are registered
-with ``deploy=True`` so they also run under ``manage.py check --deploy`` (and
-are CI-usable alongside ``rls_doctor``); E001/W002 stay non-deploy.
+The production-relevant checks (W001, W003, W004, W005, W008, E002) are
+registered with ``deploy=True`` so they also run under ``manage.py check
+--deploy`` (and are CI-usable alongside ``rls_doctor``); E001/W002 stay
+non-deploy.
 """
 
 from django.core.checks import Error, Tags, Warning, register
@@ -21,6 +22,9 @@ W002_ID = "django_tenants_rls.W002"   # TENANT_RLS_TENANT_FIELD not present on a
 W003_ID = "django_tenants_rls.W003"   # DB role bypasses RLS (superuser / BYPASSRLS)
 W004_ID = "django_tenants_rls.W004"   # RLS not actually live on a tenant table (drift)
 W005_ID = "django_tenants_rls.W005"   # UNIQUE constraint omits the tenant (cross-tenant leak)
+W006_ID = "django_tenants_rls.W006"   # (reserved)
+W007_ID = "django_tenants_rls.W007"   # (reserved)
+W008_ID = "django_tenants_rls.W008"   # registered external table is not RLS-isolated
 E001_ID = "django_tenants_rls.E001"   # session/bypass var names invalid (bad GUC format)
 E002_ID = "django_tenants_rls.E002"   # tenant PK type cannot be cast for RLS comparison
 E003_ID = "django_tenants_rls.E003"   # a non-FK column collides with the tenant FK column
@@ -57,7 +61,26 @@ def rls_live_problems(model, connection, *, force):
 
     Returns a list of human-readable problem strings (empty when the table is
     fully protected). This is the reusable per-model check shared by the W004
-    system check and the ``verify_rls`` management command.
+    system check and the ``verify_rls`` management command; it is a thin wrapper
+    around :func:`rls_live_problems_for_table` that resolves ``model``'s
+    ``db_table`` and forwards the connection / ``force`` flag unchanged (so the
+    error-handling and best-effort semantics are identical).
+    """
+    return rls_live_problems_for_table(
+        model._meta.db_table, connection, force=force
+    )
+
+
+def rls_live_problems_for_table(table, connection, *, force):
+    """Introspect ``connection`` for the live RLS state of a raw ``table``.
+
+    Returns a list of human-readable problem strings (empty when the table is
+    fully protected). This is the table-name entry point shared by the W004 and
+    W008 system checks, the ``verify_rls`` management command, and the doctor: it
+    drives the same catalog queries as :func:`rls_live_problems` (which is the
+    model-only convenience wrapper) but takes a bare (optionally schema-qualified)
+    table name so external/contrib/M2M tables -- which cannot subclass
+    ``TenantRLSModel`` -- can be verified too.
 
     The caller owns the connection and error handling. This function does NOT
     swallow database errors -- it runs four cheap catalog queries on the table
@@ -74,7 +97,6 @@ def rls_live_problems(model, connection, *, force):
       column lets a row be written with no tenant, which then becomes invisible
       to every tenant once RLS is on (an unscoped, leaking row source).
     """
-    table = model._meta.db_table
     field = conf.tenant_field()
     attname = "%s_id" % field
     problems = []
@@ -547,6 +569,67 @@ def check_rls_live(app_configs, **kwargs):
     return errors
 
 
+@register(Tags.database, deploy=True)
+def check_external_tables_isolated(app_configs, **kwargs):
+    """Warn when a registered external table is not actually RLS-isolated.
+
+    Some tables that must be tenant-isolated cannot subclass ``TenantRLSModel``
+    -- third-party / contrib tables (auth tokens, contrib auth/sessions) and
+    isolated M2M through-tables. Those are invisible to the model-only W004
+    check, ``verify_rls`` and ``rls_doctor.scan()``, so a deploy can pass a green
+    gate while e.g. ``authtoken_token`` sits in ``public`` with no policy,
+    sharing its rows across every tenant. ``TENANT_RLS_EXTERNAL_TABLES``
+    (``conf.external_tables()``) is the declarative registry of those tables;
+    this check guards each one the same way W004 guards a model table.
+
+    BEST-EFFORT: it opens a connection on the tenant alias and runs the same
+    catalog introspection as W004 (via :func:`rls_live_problems_for_table`) per
+    registered table. Any database failure (DB not created yet, not connectable,
+    non-PostgreSQL, permission denied, table missing) is swallowed and yields NO
+    findings rather than a false alarm -- if we cannot introspect, we do not warn.
+    """
+    errors = []
+    if not conf.rls_enabled():
+        return errors
+
+    from django.db import connections
+    from django_tenants.utils import get_tenant_database_alias
+
+    alias = get_tenant_database_alias()
+    force = conf.force_rls()
+    tables = conf.external_tables()
+    if not tables:
+        return errors
+
+    try:
+        connection = connections[alias]
+        if connection.vendor != "postgresql":
+            return errors
+        for table in tables:
+            for problem in rls_live_problems_for_table(table, connection, force=force):
+                errors.append(
+                    Warning(
+                        "External table %r is registered in "
+                        "TENANT_RLS_EXTERNAL_TABLES but is not isolated: %s. Its "
+                        "rows are shared across all tenants." % (table, problem),
+                        hint=(
+                            "Isolate the table with the IsolateExternalTable "
+                            "migration operation (or apply "
+                            "scaffold.isolate_external_table_sql) to ENABLE/FORCE "
+                            "ROW LEVEL SECURITY, add a tenant-isolation policy and "
+                            "make its tenant column NOT NULL, then re-run "
+                            "'manage.py verify_rls'."
+                        ),
+                        id=W008_ID,
+                    )
+                )
+    except Exception:
+        # DB not available / not introspectable during checks -> stay silent.
+        # If we cannot check, we cannot warn (best-effort by design).
+        return []
+    return errors
+
+
 def _unique_fieldsets(model):
     """Yield ``(label, fields)`` for every UNIQUE declaration on ``model``.
 
@@ -591,6 +674,50 @@ def _unique_fieldsets(model):
             )
 
 
+# Note appended to a W005 finding when the offending UNIQUE is a single
+# high-entropy, non-enumerable value (a OneToOne to a random-UUID PK, or a
+# UUIDField(unique=True)). The cross-tenant existence covert channel only has
+# teeth when an attacker can guess/enumerate the unique value to probe for a
+# collision, so this residual is benign-but-real -- documented, not dropped.
+_W005_UUID_RESIDUAL_NOTE = (
+    " This value is a random UUID and is not enumerable, so the existence-probe "
+    "channel is impractical; you may accept this as a documented residual (see "
+    "the W005 triage guide) or still tenant-scope it."
+)
+
+
+def _is_high_entropy_uuid_unique(model, fields):
+    """Return True when a single-field UNIQUE set is a high-entropy UUID value.
+
+    The two benign-residual shapes (see :data:`_W005_UUID_RESIDUAL_NOTE`):
+
+    * a ``OneToOneField`` whose ``related_model`` primary key is a ``UUIDField``
+      (so the unique column holds a random target UUID), or
+    * a field that is itself a ``UUIDField`` declared ``unique=True``.
+
+    Only a single-field UNIQUE set qualifies; a composite set is never treated as
+    a UUID residual. Best-effort: a field that cannot be resolved yields False.
+    """
+    if len(fields) != 1:
+        return False
+    try:
+        unique_field = model._meta.get_field(fields[0])
+    except Exception:
+        return False
+
+    internal_type = unique_field.get_internal_type()
+    if internal_type == "OneToOneField":
+        related_model = getattr(unique_field, "related_model", None)
+        related_pk = getattr(getattr(related_model, "_meta", None), "pk", None)
+        return (
+            related_pk is not None
+            and related_pk.get_internal_type() == "UUIDField"
+        )
+    if internal_type == "UUIDField":
+        return bool(getattr(unique_field, "unique", False))
+    return False
+
+
 @register(deploy=True)
 def check_tenant_unique_constraints(app_configs, **kwargs):
     """Warn about UNIQUE constraints on a TenantRLSModel that omit the tenant.
@@ -616,13 +743,22 @@ def check_tenant_unique_constraints(app_configs, **kwargs):
         for label, fields in _unique_fieldsets(model):
             if field in fields:
                 continue
+            message = (
+                "TenantRLSModel '%s' has a UNIQUE constraint that does not "
+                "include the tenant field '%s': %s spans %r. PostgreSQL "
+                "checks UNIQUE constraints with RLS BYPASSED, so this enforces "
+                "uniqueness across ALL tenants and leaks cross-tenant row "
+                "existence." % (model._meta.label, field, label, tuple(fields))
+            )
+            # Entropy-aware annotation: a single random-UUID unique value is not
+            # enumerable, so the existence-probe channel is impractical. We KEEP
+            # the W005 finding (the global one-per-value semantics still change)
+            # but append a note so the benign residual is distinguishable.
+            if _is_high_entropy_uuid_unique(model, fields):
+                message += _W005_UUID_RESIDUAL_NOTE
             errors.append(
                 Warning(
-                    "TenantRLSModel '%s' has a UNIQUE constraint that does not "
-                    "include the tenant field '%s': %s spans %r. PostgreSQL "
-                    "checks UNIQUE constraints with RLS BYPASSED, so this enforces "
-                    "uniqueness across ALL tenants and leaks cross-tenant row "
-                    "existence." % (model._meta.label, field, label, tuple(fields)),
+                    message,
                     hint=(
                         "Make the constraint tenant-scoped, e.g. "
                         "models.UniqueConstraint(fields=['%s', %s], name=...), and "

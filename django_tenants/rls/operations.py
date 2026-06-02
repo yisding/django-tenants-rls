@@ -21,6 +21,11 @@ from django.db.migrations.operations.base import Operation
 from . import conf
 
 
+def _quote_ident(name):
+    """Quote a SQL identifier, doubling any embedded double quotes."""
+    return '"' + str(name).replace('"', '""') + '"'
+
+
 class _RLSOperationBase(Operation):
     """Common behavior for RLS migration operations.
 
@@ -432,8 +437,6 @@ class IsolateExternalTable(_RLSOperationBase):
         if not self._is_postgresql(schema_editor):
             # Non-PostgreSQL backends have no RLS / GUC; nothing to do.
             return
-        from .scaffold import _quote_ident
-
         q_table = _quote_ident(self.table)
         q_col = _quote_ident(self._column)
         col_type = self._column_type()
@@ -478,8 +481,6 @@ class IsolateExternalTable(_RLSOperationBase):
     def database_backwards(self, app_label, schema_editor, from_state, to_state):
         if not self._is_postgresql(schema_editor):
             return
-        from .scaffold import _quote_ident
-
         q_table = _quote_ident(self.table)
         q_col = _quote_ident(self._column)
 
@@ -541,8 +542,6 @@ class IsolateExternalTable(_RLSOperationBase):
 
     @staticmethod
     def _quote_ident(name):
-        from .scaffold import _quote_ident
-
         return _quote_ident(name)
 
     # -- migration plumbing -----------------------------------------------------
