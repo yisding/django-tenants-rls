@@ -490,7 +490,7 @@ stays silent rather than raising a false alarm.
    to *no finding*, disabling this safety net. Set it only for a deliberate,
    well-understood case -- for example a migration-only connection that never
    serves tenant traffic. With it on, isolation depends entirely on you never
-   pointing tenant requests at the bypassing role. See :ref:`bypass-leak-note`.
+   pointing tenant requests at the bypassing role. See :ref:`the bypass-reset note <bypass-leak-note>`.
 
 Connection poolers
 ------------------
@@ -1709,7 +1709,7 @@ SECURITY**.
    ``bypass_rls()`` is a tenant-isolation hole for the duration of the block --
    it makes *all* tenants' rows visible and writable. Keep the block as narrow
    as the backfill itself, and never leave a connection in the bypass state.
-   See :ref:`bypass-leak-note` for the per-cursor re-assertion that keeps this
+   See :ref:`the bypass-reset note <bypass-leak-note>` for the per-cursor re-assertion that keeps this
    safe across pooled/reused connections.
 
 If you would rather avoid the bypass entirely, run the backfill while RLS is
@@ -2509,7 +2509,7 @@ tenant:
    a silent correctness bug, not an error. Pass the tenant pk into the task
    payload and wrap the body in ``rls_context``.
 
-See :ref:`bypass-leak-note` for how bypass state interacts with tenant
+See :ref:`the bypass-reset note <bypass-leak-note>` for how bypass state interacts with tenant
 (re)activation inside these blocks.
 
 .. _rls-migration-inprocess-background:
@@ -2621,7 +2621,7 @@ by a ``tenant_context`` / ``schema_context`` nested inside it.
             Note.objects.all()              # sees ALL tenants' rows
 
 As a rule, open ``bypass_rls()`` **after** any tenant activation so the block is
-not silently cancelled by a nested ``set_tenant()``. See :ref:`bypass-leak-note`
+not silently cancelled by a nested ``set_tenant()``. See :ref:`the bypass-reset note <bypass-leak-note>`
 for why this reset exists and what stops a leaked bypass from crossing requests.
 
 ``save()`` auto-fills ``tenant_id``; bulk paths do not
@@ -2663,7 +2663,7 @@ override is a no-op.
    the database rather than silently writing cross-tenant rows. This is defense
    in depth -- but rely on it as a backstop, not as your primary mechanism: set
    the tenant explicitly on every bulk path. See
-   :ref:`bypass-leak-note` for the related bypass caveat.
+   :ref:`the bypass-reset note <bypass-leak-note>` for the related bypass caveat.
 
 .. _rls-migration-no-autostamp:
 
@@ -4103,7 +4103,7 @@ work that needs it*. The backend derives both GUCs from the connection's Python
 source-of-truth (``_rls_tenant_id`` and ``_rls_bypass``) on every cursor, so a
 connection reused by a different request -- or after a transaction rollback --
 carries the correct tenant and a bypass that has snapped back to ``off`` (see
-:ref:`bypass-leak-note`).
+:ref:`the bypass-reset note <bypass-leak-note>`).
 
 .. important::
 
@@ -4173,7 +4173,7 @@ Under that deployment there is no per-cursor re-assertion to fall back on, so
 **do not remove this middleware** and do not let it drift out of ``MIDDLEWARE``
 (it must sit *after* ``TenantMainMiddleware``). Removing it reopens the
 bypass-leak gap on pooled/persistent connections described in
-:ref:`bypass-leak-note`. On the RLS backend the middleware is redundant but
+:ref:`the bypass-reset note <bypass-leak-note>`. On the RLS backend the middleware is redundant but
 harmless, so it is safe to leave installed in either deployment.
 
 .. warning::
@@ -4791,7 +4791,7 @@ activation:
         with bypass_rls():             # open bypass last -> it sticks
             Note.objects.all()         # cross-tenant visibility here
 
-See :ref:`bypass-leak-note` for the full reasoning.
+See :ref:`the bypass-reset note <bypass-leak-note>` for the full reasoning.
 
 
 FAQ
@@ -4863,7 +4863,7 @@ in ``bypass_rls()``, scoped as tightly as possible:
         Note.objects.all()      # sees ALL tenants' rows; writes unrestricted
 
 Keep the block as small as possible -- ``bypass_rls()`` removes isolation for its
-duration. See :ref:`bypass-leak-note`.
+duration. See :ref:`the bypass-reset note <bypass-leak-note>`.
 
 Do I need ``TenantRLSMiddleware``?
 ----------------------------------
@@ -4873,7 +4873,7 @@ Only on the **stock-backend fallback** (you kept the standard
 recommended RLS backend (``ENGINE = 'django_tenants.rls.backend'``) it is
 **optional**: the backend re-asserts the tenant and bypass session variables on
 every cursor, so the middleware is redundant. It is harmless if left installed,
-so you can keep it during a backend switch. See :ref:`bypass-leak-note`.
+so you can keep it during a backend switch. See :ref:`the bypass-reset note <bypass-leak-note>`.
 
 Is the ``tenant_id`` column kept if I disable RLS?
 --------------------------------------------------
