@@ -59,3 +59,25 @@ class NoteIsolationHelperTestCase(RLSIsolationTestCaseMixin, TransactionTestCase
         # ``Note.text`` has a blank default, so the mixin's default per-row kwargs
         # (just the tenant FK) are sufficient -- no ``make_row`` needed.
         self.assertIsolated(Note, self.tenant_a, self.tenant_b)
+
+    def test_assert_requires_tenant_for_guarded_callable(self):
+        # A callable guarded by require_current_tenant() must fail closed when
+        # invoked with no active tenant.
+        from django_tenants.rls.session import (
+            NoActiveTenant,
+            require_current_tenant,
+        )
+
+        self.assertRequiresTenant(
+            lambda: require_current_tenant(using=self._connection.alias),
+            exc=NoActiveTenant,
+        )
+
+    def test_assert_no_leak_after_clean_callable(self):
+        # A callable that opens and cleanly exits an rls_context must leave the
+        # connection at the secure default (no active tenant, bypass off).
+        def work():
+            with self.as_tenant(self.tenant_a):
+                list(Note.objects.all())
+
+        self.assertNoLeakAfter(work)

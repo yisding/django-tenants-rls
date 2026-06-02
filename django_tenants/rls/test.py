@@ -362,6 +362,22 @@ class RLSIsolationTestCaseMixin:
         with bypass_rls():
             self.rls_model.objects.all().delete()
 
+    def _fixture_teardown(self):
+        # This mixin deliberately keeps class-level fixtures alive for the whole
+        # TestCase -- the rls_model table and its policies, plus tenant_a/tenant_b
+        # -- and resets per-test state in setUp() (it deletes the rls_model rows
+        # under bypass before each test). TransactionTestCase's default
+        # _fixture_teardown instead TRUNCATEs every table in the database between
+        # tests, which here is both:
+        #   * impossible -- the test phase runs as the least-privilege app role
+        #     (NOSUPERUSER, granted only row DML) which cannot TRUNCATE, and
+        #   * wrong -- it would destroy the class-level tenant fixtures the next
+        #     test method still needs.
+        # Per-test isolation is already provided by setUp(), so the destructive
+        # flush is redundant as well as harmful. Skip it; class-level teardown
+        # (_teardown_db) drops everything we created once, in tearDownClass.
+        return
+
     # -- helpers ---------------------------------------------------------------
 
     def as_tenant(self, tenant):
