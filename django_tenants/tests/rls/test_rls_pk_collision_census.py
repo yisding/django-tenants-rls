@@ -315,7 +315,6 @@ class CollisionCensusRekeyOrderTestCase(SimpleTestCase):
         code, out, err = _run([parent, child])
         self.assertIsNone(code)
         # In the re-key section, Author must appear before Note.
-        idx_author = out.index("app.Author")
         # Use the re-key listing region (after the heading).
         rekey = out[out.index("re-key order"):]
         self.assertLess(rekey.index("app.Author"), rekey.index("app.Note"))
